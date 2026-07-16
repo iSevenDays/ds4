@@ -102,12 +102,14 @@ int ds4_gpu_should_use_managed_kv_cache(uint64_t kv_cache_bytes, uint64_t contex
 void ds4_gpu_set_quality(bool quality);
 void ds4_gpu_set_ssd_streaming(bool enabled);
 void ds4_gpu_set_streaming_expert_cache_budget(uint32_t experts);
+void ds4_gpu_set_streaming_expert_cache_expert_bytes(uint64_t bytes);
 uint64_t ds4_gpu_recommended_working_set_size(void);
 uint32_t ds4_gpu_stream_expert_cache_configured_count(void);
 uint32_t ds4_gpu_stream_expert_cache_current_count(void);
 /* Reset only the prompt-local eviction heuristic.  The resident SSD expert
  * cache itself is intentionally kept warm across sessions. */
 void ds4_gpu_stream_expert_cache_reset_route_hotness(void);
+void ds4_gpu_stream_expert_cache_release_resident(void);
 uint32_t ds4_gpu_stream_expert_cache_budget_for_expert_size(
         uint64_t gate_expert_bytes,
         uint64_t down_expert_bytes);
@@ -128,6 +130,19 @@ int ds4_gpu_stream_expert_cache_begin_selected_load(
         uint64_t       model_size,
         uint32_t       layer,
         const int32_t *selected_ids,
+        uint32_t       n_total_expert,
+        uint32_t       n_selected,
+        uint64_t       gate_offset,
+        uint64_t       up_offset,
+        uint64_t       down_offset,
+        uint64_t       gate_expert_bytes,
+        uint64_t       down_expert_bytes);
+int ds4_gpu_stream_expert_cache_prepare_selected_batch(
+        const void    *model_map,
+        uint64_t       model_size,
+        uint32_t       layer,
+        const int32_t *selected_ids,
+        uint32_t       n_tokens,
         uint32_t       n_total_expert,
         uint32_t       n_selected,
         uint64_t       gate_offset,

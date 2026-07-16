@@ -15700,6 +15700,14 @@ static bool metal_graph_encode_decode_layer(
         }
         return ok;
     }
+    /* NOTE: SSD streaming routed-MoE on the decode fallback path (neither
+     * selected_readahead_shared_delay nor overlap_selected_shared) is not yet
+     * wired: this path has no expert-staging producer, so g_stream_selected_cache
+     * stays invalid and the matmul falls back to cuda_resolve_weight_ptr.  In
+     * batched-SSD-decode mode (the default) a synchronous producer cannot be
+     * inserted here without breaking the single command buffer.  Enabling one
+     * of the async-overlap branches (or disabling layer batching) is the
+     * follow-up; tracked as the next milestone. */
     if (ok) ok = ds4_gpu_routed_moe_one_tensor(metal_graph_routed_out(g),
                                                  metal_graph_routed_gate(g),
                                                  metal_graph_routed_up(g),
@@ -18555,6 +18563,97 @@ static bool metal_graph_encode_layer_attention_batch(
     return ok;
 }
 
+/* SSD streaming prefill producer (single-tier CUDA port from main): read back
+ * the batch router-selected expert ids for this layer and stage the compact
+ * (gate, up, down) slab into the resident device cache before the routed-MoE
+ * matmul consumes it.  Uses q4k's flat ds4_gpu_stream_expert_cache_prepare_*
+ * signature (no ds4_gpu_stream_expert_table struct in this build). */
+static bool metal_graph_cuda_stream_prefill_batch_selected_load(
+        ds4_gpu_graph            *g,
+        const ds4_model          *model,
+        const ds4_layer_weights  *layer,
+        uint32_t                  il,
+        uint32_t                  n_tokens,
+        uint64_t                  gate_expert_bytes,
+        uint64_t                  down_expert_bytes) {
+#if !defined(DS4_ROCM_BUILD) && !defined(DS4_NO_GPU) && !defined(__APPLE__)
+    if (!g || !model || !layer ||
+        !metal_graph_batch_router_selected(g) ||
+        n_tokens <= 1 ||
+        DS4_N_EXPERT == 0 ||
+        DS4_N_EXPERT_USED == 0 ||
+        getenv("DS4_CUDA_DISABLE_STREAMING_PREFILL_BATCH_SELECTED_LOAD") != NULL) {
+        return true;
+    }
+
+    if ((uint64_t)n_tokens > UINT64_MAX / (uint64_t)DS4_N_EXPERT_USED) {
+        fprintf(stderr, "ds4: CUDA streaming prefill selected-id count overflow at layer %u\n", il);
+        return false;
+    }
+    const uint64_t n_ids64 = (uint64_t)n_tokens * DS4_N_EXPERT_USED;
+    if (n_ids64 == 0 || n_ids64 > SIZE_MAX / sizeof(int32_t)) {
+        fprintf(stderr, "ds4: CUDA streaming prefill selected-id byte size overflow at layer %u\n", il);
+        return false;
+    }
+
+    const bool profile =
+        getenv("DS4_CUDA_STREAMING_PREFILL_BATCH_SELECTED_PROFILE") != NULL;
+    const double t0 = profile ? now_sec() : 0.0;
+
+    if (ds4_gpu_end_commands() == 0) return false;
+    const double t_sync = profile ? now_sec() : 0.0;
+
+    int32_t *selected_ids = xmalloc((size_t)n_ids64 * sizeof(selected_ids[0]));
+    bool ok = ds4_gpu_tensor_read(metal_graph_batch_router_selected(g),
+                                  0,
+                                  selected_ids,
+                                  n_ids64 * sizeof(selected_ids[0])) != 0;
+    const double t_read = profile ? now_sec() : 0.0;
+    if (ok) {
+        ok = ds4_gpu_stream_expert_cache_prepare_selected_batch(
+                    model->map,
+                    model->size,
+                    il,
+                    selected_ids,
+                    n_tokens,
+                    DS4_N_EXPERT,
+                    DS4_N_EXPERT_USED,
+                    layer->ffn_gate_exps->abs_offset,
+                    layer->ffn_up_exps->abs_offset,
+                    layer->ffn_down_exps->abs_offset,
+                    gate_expert_bytes,
+                    down_expert_bytes) != 0;
+    }
+    free(selected_ids);
+    const double t_load = profile ? now_sec() : 0.0;
+
+    if (ds4_gpu_begin_commands() == 0) ok = false;
+    const double t_done = profile ? now_sec() : 0.0;
+
+    if (profile) {
+        fprintf(stderr,
+                "ds4: CUDA streaming prefill batch selected load layer=%u tokens=%u sync=%.3f ms read=%.3f ms load=%.3f ms resume=%.3f ms total=%.3f ms\n",
+                il,
+                n_tokens,
+                (t_sync - t0) * 1000.0,
+                (t_read - t_sync) * 1000.0,
+                (t_load - t_read) * 1000.0,
+                (t_done - t_load) * 1000.0,
+                (t_done - t0) * 1000.0);
+    }
+    return ok;
+#else
+    (void)g;
+    (void)model;
+    (void)layer;
+    (void)il;
+    (void)n_tokens;
+    (void)gate_expert_bytes;
+    (void)down_expert_bytes;
+    return true;
+#endif
+}
+
 /* Encode the batched prefill FFN half: HC pre/norm, shared expert, routed
  * experts, sum, and HC post. */
 static bool metal_graph_encode_layer_ffn_batch(
@@ -18859,6 +18958,16 @@ static bool metal_graph_encode_layer_ffn_batch(
             ok = false;
         }
         if (ok) ok = ds4_gpu_begin_commands() != 0;
+    }
+
+    if (ok && g->ssd_streaming) {
+        ok = metal_graph_cuda_stream_prefill_batch_selected_load(g,
+                                                                 model,
+                                                                 layer,
+                                                                 il,
+                                                                 n_tokens,
+                                                                 gate_expert_bytes,
+                                                                 down_expert_bytes);
     }
 
     if (ok) {
@@ -26002,6 +26111,12 @@ static int ds4_engine_open_internal(ds4_engine **out,
     if (opt->warm_weights) model_warm_weights(&e->model);
     if (!opt->inspect_only) vocab_load(&e->vocab, &e->model);
     config_validate_model(&e->model);
+    if (e->ssd_streaming && !ds4_backend_supports_ssd_streaming(e->backend)) {
+        fprintf(stderr, "ds4: --ssd-streaming is currently supported only with --metal/--cuda/--rocm\n");
+        ds4_engine_close(e);
+        *out = NULL;
+        return 1;
+    }
     /* SSD streaming is supported on CUDA (single-tier path). Multi-GPU SSD
      * streaming (per-device caches/streams) is wired in a later milestone;
      * until then a multi-tier request with --ssd-streaming falls back to the
@@ -26170,6 +26285,15 @@ static int ds4_engine_open_internal(ds4_engine **out,
             return 1;
         }
         ds4_gpu_set_streaming_expert_cache_budget(e->ssd_streaming_cache_experts);
+        if (e->ssd_streaming) {
+            /* Pin the expert cache's slab size class to the model's uniform
+             * per-expert bytes (single-tier port from main; the mixed-precision
+             * boosted-layer detection from main is not wired here yet). */
+            uint64_t slab_expert_bytes = 0;
+            if (ds4_streaming_routed_expert_bytes(&e->weights, &slab_expert_bytes)) {
+                ds4_gpu_set_streaming_expert_cache_expert_bytes(slab_expert_bytes);
+            }
+        }
         (void)ds4_gpu_set_model_fd(e->model.fd);
         int model_map_ok = 0;
         uint64_t *load_offsets = NULL;
