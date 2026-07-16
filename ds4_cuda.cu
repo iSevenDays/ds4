@@ -19,6 +19,8 @@
 #include <vector>
 #include <algorithm>
 
+#include "ds4_gpu.h"
+
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
 #endif
@@ -148,17 +150,9 @@ static inline int ds4_tensor_device_idx(const ds4_gpu_tensor *t) {
 /* =========================================================================
  * Per-device selective model cache (selective model cache).
  *
- * The public API in ds4_gpu.h declares ds4_tensor_range and the
- * device_cache_tensors / lookup_cache entry points. ds4_cuda.cu does NOT
- * include ds4_gpu.h historically (a pre-existing project convention), so
- * we redeclare the struct here with the same layout the header uses.
- * The implementation links by C linkage; struct compatibility is by
- * field layout. */
-typedef struct {
-    uint64_t source_offset;
-    uint64_t bytes;
-    int      target_device;
-} ds4_tensor_range;
+ * ds4_tensor_range and the device_cache_tensors / lookup_cache entry points
+ * are declared in ds4_gpu.h, which ds4_cuda.cu includes.
+ * ========================================================================= */
 
 struct cuda_device_cache {
     void   *base;     /* device-side slab base */
@@ -212,24 +206,6 @@ struct cuda_q8_f32_range {
     float *device_ptr;
     int device_id;          /* physical CUDA device id; 0 in single-tier */
 };
-
-static std::vector<cuda_model_range> g_model_ranges;
-static std::vector<cuda_model_arena> g_model_arenas;
-static std::unordered_map<uint64_t, size_t> g_model_range_by_offset;
-static std::vector<cuda_q8_f16_range> g_q8_f16_ranges;
-static std::unordered_map<uint64_t, size_t> g_q8_f16_by_offset;
-static std::vector<cuda_q8_f32_range> g_q8_f32_ranges;
-static std::unordered_map<uint64_t, size_t> g_q8_f32_by_offset;
-
-/* =========================================================================
- * SSD weight-streaming data structures (single-tier port from main).
- *
- * These describe the per-layer "selected expert" compact cache (the
- * gate/up/down weight slabs staged to the device for the experts actually
- * routed by the current token/batch) and the resident LRU expert cache used
- * to amortize cross-layer expert loads.  In multi-tier builds these live on
- * the global (tier-0) state; per-device partitioning is a later milestone.
- * ========================================================================= */
 
 struct cuda_stream_selected_cache {
     int valid;
@@ -286,9 +262,39 @@ struct cuda_stream_expert_cache {
     std::vector<cuda_stream_expert_cache_slot> slots;
 };
 
+static std::vector<cuda_model_range> g_model_ranges;
+static std::vector<cuda_model_arena> g_model_arenas;
+static std::unordered_map<uint64_t, size_t> g_model_range_by_offset;
+static std::vector<cuda_q8_f16_range> g_q8_f16_ranges;
+static std::unordered_map<uint64_t, size_t> g_q8_f16_by_offset;
+static std::vector<cuda_q8_f32_range> g_q8_f32_ranges;
+static std::unordered_map<uint64_t, size_t> g_q8_f32_by_offset;
+
+/* =========================================================================
+ * SSD weight-streaming data structures (single-tier port from main).
+ *
+ * These describe the per-layer "selected expert" compact cache (the
+ * gate/up/down weight slabs staged to the device for the experts actually
+ * routed by the current token/batch) and the resident LRU expert cache used
+ * to amortize cross-layer expert loads.  In multi-tier builds these live on
+ * the global (tier-0) state; per-device partitioning is a later milestone.
+ * ========================================================================= */
+
 /* g_stream_expert_budget_override stays GLOBAL — it is the user-facing cap
  * (from --ssd-streaming-cache-experts) applied uniformly to every tier. */
 static uint32_t g_stream_expert_budget_override;
+
+/* Compatibility shims: antirez's single-device SSD helper functions (folded
+ * in from the merge for the resident-path cache invalidation/release) reference
+ * these globals. Our per-device SSD streaming uses the g_ssd[] array below;
+ * these single-device variables stay zero-initialized and are only touched by
+ * the antirez helpers called from cuda_model_set_host_map. */
+static cuda_stream_selected_cache g_stream_selected_cache;
+static cuda_stream_expert_cache g_stream_expert_cache;
+static uint32_t g_stream_expert_runtime_cap;
+static uint64_t g_stream_expert_runtime_gate_bytes;
+static uint64_t g_stream_expert_runtime_down_bytes;
+static uint32_t g_stream_expert_memory_cap_notice;
 
 /* Per-tier SSD streaming state. SSD streaming was originally single-device:
  * one expert cache, one selected-expert cache, one pinned staging pool, one
@@ -340,6 +346,8 @@ static uint64_t g_q8_f32_bytes;
 static int g_q8_f16_disabled_after_oom;
 static int g_q8_f16_budget_notice_printed;
 static uint64_t g_model_load_progress_next;
+static uint64_t g_model_load_progress_last_bytes = UINT64_MAX;
+static uint64_t g_model_load_progress_last_cgib = UINT64_MAX;
 static double g_model_load_progress_last;
 static int g_model_load_progress_started;
 static int g_model_load_progress_tty;
@@ -349,6 +357,11 @@ static void *g_model_stage_raw[4];
 static void *g_model_stage[4];
 static cudaEvent_t g_model_stage_event[4];
 static uint64_t g_model_stage_bytes;
+static void *g_stream_selected_stage_raw[4];
+static void *g_stream_selected_stage[4];
+static cudaEvent_t g_stream_selected_stage_event[4];
+static uint64_t g_stream_selected_stage_bytes;
+static cudaStream_t g_stream_selected_upload_stream;
 
 static int cuda_ok(cudaError_t err, const char *what);
 static const char *cuda_model_range_ptr_from_fd(
@@ -356,6 +369,7 @@ static const char *cuda_model_range_ptr_from_fd(
         uint64_t offset,
         uint64_t bytes,
         const char *what);
+static const char *cuda_model_direct_fallback_ptr(const void *model_map, uint64_t offset);
 static int cuda_model_copy_to_device_streamed(
         char *dst,
         const void *model_map,
@@ -363,15 +377,6 @@ static int cuda_model_copy_to_device_streamed(
         uint64_t offset,
         uint64_t bytes,
         const char *what);
-static void cuda_stream_selected_cache_invalidate(void);
-
-/* Forward declaration: defined later in this file. The resolver wrapper
- * below uses it for multi-tier dispatch. */
-extern "C" int ds4_gpu_lookup_cache_strict(uint64_t source_offset,
-                                            uint64_t bytes,
-                                            int      expected_device,
-                                            void   **out_device_ptr);
-static const char *cuda_model_direct_fallback_ptr(const void *model_map, uint64_t offset);
 static uint64_t cuda_model_cache_limit_bytes(void);
 static uint64_t cuda_model_local_model_limit_bytes(void);
 static int cuda_model_cache_limit_explicit(void);
@@ -408,7 +413,6 @@ static void *cuda_tmp_alloc(uint64_t bytes, const char *what) {
     g_cuda_tmp_bytes = bytes;
     return g_cuda_tmp;
 }
-
 /* Per-tier scratch accessor.
  *
  * Behavior:
@@ -1234,47 +1238,11 @@ static int cuda_model_load_progress_enabled(void) {
 
 static void cuda_model_load_progress_reset(void) {
     g_model_load_progress_next = 0;
+    g_model_load_progress_last_bytes = UINT64_MAX;
+    g_model_load_progress_last_cgib = UINT64_MAX;
     g_model_load_progress_last = 0.0;
     g_model_load_progress_started = 0;
     g_model_load_progress_tty = 0;
-}
-
-static void cuda_model_load_progress_note(uint64_t cached_bytes) {
-    if (!cuda_model_load_progress_enabled()) return;
-
-    const double now = cuda_wall_sec();
-    if (!g_model_load_progress_started) {
-        g_model_load_progress_started = 1;
-        g_model_load_progress_tty = isatty(STDERR_FILENO) != 0;
-        g_model_load_progress_next = (g_model_load_progress_tty ? 2ull : 16ull) *
-                                     1024ull * 1024ull * 1024ull;
-        g_model_load_progress_last = now;
-        if (g_model_load_progress_tty) {
-            fprintf(stderr, "\r\033[Kds4: CUDA loading model tensors into device cache: 0.00 GiB");
-        } else {
-            fprintf(stderr, "ds4: CUDA loading model tensors into device cache\n");
-        }
-    }
-
-    if (cached_bytes < g_model_load_progress_next &&
-        now - g_model_load_progress_last < (g_model_load_progress_tty ? 2.0 : 10.0)) {
-        return;
-    }
-
-    if (g_model_load_progress_tty) {
-        fprintf(stderr, "\r\033[Kds4: CUDA loading model tensors into device cache: %.2f GiB",
-                (double)cached_bytes / 1073741824.0);
-    } else {
-        fprintf(stderr, "ds4: CUDA loading model tensors %.2f GiB cached\n",
-                (double)cached_bytes / 1073741824.0);
-    }
-    fflush(stderr);
-    g_model_load_progress_last = now;
-    const uint64_t step = (g_model_load_progress_tty ? 2ull : 16ull) *
-                          1024ull * 1024ull * 1024ull;
-    while (g_model_load_progress_next <= cached_bytes) {
-        g_model_load_progress_next += step;
-    }
 }
 
 static void cuda_model_load_progress_finish(void) {
@@ -1284,6 +1252,53 @@ static void cuda_model_load_progress_finish(void) {
         fflush(stderr);
     }
     g_model_load_progress_started = 0;
+}
+
+static void cuda_model_load_progress_note(uint64_t cached_bytes) {
+    if (!cuda_model_load_progress_enabled()) return;
+
+    const double now = cuda_wall_sec();
+    const int tty = isatty(STDERR_FILENO) != 0;
+    const uint64_t step = (tty ? 2ull : 16ull) *
+                          1024ull * 1024ull * 1024ull;
+    const uint64_t gib = 1024ull * 1024ull * 1024ull;
+    const uint64_t display_cgib =
+        cached_bytes > (UINT64_MAX - gib / 2ull) / 100ull ?
+        UINT64_MAX : (cached_bytes * 100ull + gib / 2ull) / gib;
+    if (g_model_load_progress_next == 0) {
+        g_model_load_progress_next = step;
+    }
+    if (g_model_load_progress_last != 0.0 &&
+        (cached_bytes == g_model_load_progress_last_bytes ||
+         display_cgib == g_model_load_progress_last_cgib)) {
+        return;
+    }
+    if (g_model_load_progress_last != 0.0 &&
+        cached_bytes < g_model_load_progress_next &&
+        now - g_model_load_progress_last < (tty ? 2.0 : 10.0)) {
+        return;
+    }
+
+    g_model_load_progress_started = 1;
+    g_model_load_progress_tty = tty;
+    if (g_model_load_progress_tty) {
+        fprintf(stderr, "\r\033[Kds4: CUDA loading model tensors into device cache: %.2f GiB",
+                (double)cached_bytes / 1073741824.0);
+    } else {
+        if (g_model_load_progress_last == 0.0) {
+            fprintf(stderr, "ds4: CUDA loading model tensors into device cache\n");
+        } else {
+            fprintf(stderr, "ds4: CUDA loading model tensors %.2f GiB cached\n",
+                    (double)cached_bytes / 1073741824.0);
+        }
+    }
+    fflush(stderr);
+    g_model_load_progress_last_bytes = cached_bytes;
+    g_model_load_progress_last_cgib = display_cgib;
+    g_model_load_progress_last = now;
+    while (g_model_load_progress_next <= cached_bytes) {
+        g_model_load_progress_next += step;
+    }
 }
 
 static int cuda_model_prefetch_range(const void *model_map, uint64_t model_size, uint64_t map_offset, uint64_t map_size) {
@@ -1806,6 +1821,7 @@ static int cuda_model_copy_chunked(const void *model_map, uint64_t model_size, u
 }
 
 static void cuda_model_range_release_all(void) {
+    cuda_model_load_progress_finish();
     for (const cuda_model_range &r : g_model_ranges) {
         if (r.host_registered && r.registered_base) {
             (void)cudaHostUnregister(r.registered_base);
@@ -1820,13 +1836,7 @@ static void cuda_model_range_release_all(void) {
     g_model_ranges.clear();
     g_model_range_by_offset.clear();
     g_model_range_bytes = 0;
-    cuda_model_load_progress_reset();
 }
-
-/* =========================================================================
- * SSD weight-streaming helpers (single-tier port from main).
- * =========================================================================
- */
 
 static void cuda_stream_selected_cache_invalidate(void) {
     ssd_current()->selected_cache.valid = 0;
@@ -2952,6 +2962,7 @@ extern "C" void ds4_gpu_cleanup(void) {
     /* Continue with legacy global teardown below. */
 
     cuda_model_range_release_all();
+    cuda_model_load_progress_reset();
     cuda_q8_f16_cache_release_all();
     g_q8_f16_disabled_after_oom = 0;
     g_q8_f16_budget_notice_printed = 0;
@@ -3004,6 +3015,7 @@ extern "C" void ds4_gpu_cleanup(void) {
     g_model_file_size = 0;
     g_model_cache_full = 0;
     g_model_mapping_failure_notice_printed = 0;
+    g_ssd_streaming_mode = 0;
     if (g_model_prefetch_stream) {
         (void)cudaStreamDestroy(g_model_prefetch_stream);
         g_model_prefetch_stream = NULL;
@@ -3240,6 +3252,17 @@ extern "C" int ds4_gpu_tensor_read(const ds4_gpu_tensor *tensor, uint64_t offset
     return ok;
 }
 
+extern "C" int ds4_gpu_tensor_read_after_selected_event(const ds4_gpu_tensor *tensor,
+                                                         uint64_t offset,
+                                                         void *data,
+                                                         uint64_t bytes,
+                                                         uint64_t event_value,
+                                                         const char *label) {
+    (void)event_value;
+    (void)label;
+    return ds4_gpu_tensor_read(tensor, offset, data, bytes);
+}
+
 extern "C" int ds4_gpu_tensor_copy(ds4_gpu_tensor *dst, uint64_t dst_offset,
                                      const ds4_gpu_tensor *src, uint64_t src_offset,
                                      uint64_t bytes) {
@@ -3360,12 +3383,28 @@ extern "C" int ds4_gpu_wait_selected_readback_ready(uint64_t event_value, const 
     (void)label;
     return cuda_ok(cudaDeviceSynchronize(), "selected readback wait");
 }
-extern "C" int ds4_gpu_end_commands(void) { return cuda_ok(cudaDeviceSynchronize(), "end commands"); }
-extern "C" int ds4_gpu_synchronize(void) { return cuda_ok(cudaDeviceSynchronize(), "synchronize"); }
+extern "C" int ds4_gpu_end_commands(void) {
+    cuda_model_load_progress_finish();
+    return cuda_ok(cudaDeviceSynchronize(), "end commands");
+}
+extern "C" int ds4_gpu_synchronize(void) {
+    cuda_model_load_progress_finish();
+    return cuda_ok(cudaDeviceSynchronize(), "synchronize");
+}
 
 static int cuda_model_set_host_map(const void *model_map, uint64_t model_size) {
     if (!model_map || model_size == 0) return 0;
+    const int same_backing_model =
+        g_model_host_base == model_map &&
+        g_model_registered_size == model_size;
+    cuda_stream_selected_cache_invalidate();
+    if (!same_backing_model) {
+        cuda_stream_expert_cache_release_all();
+    }
     cuda_model_range_release_all();
+    if (!same_backing_model) {
+        cuda_model_load_progress_reset();
+    }
     cuda_q8_f16_cache_release_all();
     g_q8_f16_disabled_after_oom = 0;
     g_q8_f16_budget_notice_printed = 0;
@@ -3375,17 +3414,21 @@ static int cuda_model_set_host_map(const void *model_map, uint64_t model_size) {
     g_q8_f32_ranges.clear();
     g_q8_f32_by_offset.clear();
     g_q8_f32_bytes = 0;
-    if (g_model_device_owned && g_model_device_base) {
-        (void)cudaFree((void *)g_model_device_base);
-        g_model_device_owned = 0;
+    if (!same_backing_model) {
+        if (g_model_device_owned && g_model_device_base) {
+            (void)cudaFree((void *)g_model_device_base);
+            g_model_device_owned = 0;
+        }
+        if (g_model_registered && g_model_host_base) {
+            (void)cudaHostUnregister((void *)g_model_host_base);
+            g_model_registered = 0;
+        }
+        g_model_host_base = model_map;
+        g_model_device_base = (const char *)model_map;
+        g_model_registered_size = model_size;
+    } else if (!g_model_device_owned && !g_model_registered) {
+        g_model_device_base = (const char *)model_map;
     }
-    if (g_model_registered && g_model_host_base) {
-        (void)cudaHostUnregister((void *)g_model_host_base);
-        g_model_registered = 0;
-    }
-    g_model_host_base = model_map;
-    g_model_device_base = (const char *)model_map;
-    g_model_registered_size = model_size;
     g_model_range_mapping_supported = 1;
     g_model_hmm_direct = 0;
     g_model_cache_full = 0;
@@ -3517,11 +3560,7 @@ extern "C" int ds4_gpu_set_model_map_spans(
 /* Register the mmap'd host model pointer for selective-cache lookups WITHOUT
  * triggering any device-side copy. Used by multi-GPU placement scaffolding's
  * multi-tier path so DS4_CUDA_COPY_MODEL cannot reintroduce a full-model
- * copy that defeats the per-device selective cache.
- *
- * This is the no-copy subset of ds4_gpu_set_model_map: same bookkeeping
- * for the host pointer plus cudaHostRegister, but skipping the
- * DS4_CUDA_COPY_MODEL branch that allocates and copies the entire model. */
+ * copy that defeats the per-device selective cache. */
 extern "C" int ds4_gpu_register_model_map_no_copy(const void *model_map, uint64_t model_size) {
     if (!model_map || model_size == 0) return 0;
     if (g_model_host_base == model_map && g_model_registered_size == model_size) return 1;
@@ -4621,7 +4660,6 @@ if (!model_map || !expert_ids || n_experts == 0 ||
     }
     return 1;
 }
-
 
 __global__ static void embed_token_hc_kernel(float *out, const unsigned short *w, uint32_t token, uint32_t n_embd, uint32_t n_hc) {
     uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
@@ -12210,15 +12248,16 @@ __global__ static void moe_count_sorted_pairs_kernel(
 __global__ static void moe_prefix_sorted_pairs_kernel(
         uint32_t *offsets,
         uint32_t *cursors,
-        const uint32_t *counts) {
+        const uint32_t *counts,
+        uint32_t expert_count) {
     if (threadIdx.x == 0) {
         uint32_t sum = 0;
-        for (uint32_t e = 0; e < 256u; e++) {
+        for (uint32_t e = 0; e < expert_count; e++) {
             offsets[e] = sum;
             cursors[e] = sum;
             sum += counts[e];
         }
-        offsets[256] = sum;
+        offsets[expert_count] = sum;
     }
 }
 
@@ -12239,14 +12278,15 @@ __global__ static void moe_build_expert_tile_offsets_kernel(
         uint32_t *tile_offsets,
         uint32_t *tile_total,
         const uint32_t *counts,
+        uint32_t expert_count,
         uint32_t block_m) {
     if (threadIdx.x == 0) {
         uint32_t sum = 0;
-        for (uint32_t e = 0; e < 256u; e++) {
+        for (uint32_t e = 0; e < expert_count; e++) {
             tile_offsets[e] = sum;
             sum += (counts[e] + block_m - 1u) / block_m;
         }
-        tile_offsets[256] = sum;
+        tile_offsets[expert_count] = sum;
         *tile_total = sum;
     }
 }
@@ -12256,9 +12296,10 @@ __global__ static void moe_build_expert_tiles_kernel(
         uint32_t *tile_starts,
         const uint32_t *tile_offsets,
         const uint32_t *counts,
+        uint32_t expert_count,
         uint32_t block_m) {
-    uint32_t e = threadIdx.x;
-    if (e >= 256u) return;
+    uint32_t e = (uint32_t)((uint64_t)blockIdx.x * blockDim.x + threadIdx.x);
+    if (e >= expert_count) return;
     uint32_t ntiles = (counts[e] + block_m - 1u) / block_m;
     uint32_t off = tile_offsets[e];
     for (uint32_t t = 0; t < ntiles; t++) {
@@ -14076,17 +14117,21 @@ static int routed_moe_launch(
         ok = cuda_ok(cudaGetLastError(), "routed_moe x quantize launch");
         if (prof_ev[1]) (void)cudaEventRecord(prof_ev[1], 0);
         if (ok && use_sorted_pairs) {
-            const uint64_t counts_bytes = 256ull * sizeof(uint32_t);
-            const uint64_t offsets_bytes = 257ull * sizeof(uint32_t);
-            const uint64_t cursors_bytes = 256ull * sizeof(uint32_t);
+            const uint32_t sort_expert_count =
+                use_stream_selected_cache ? g_stream_selected_cache.compact_count :
+                n_total_expert;
+            if (sort_expert_count == 0) ok = 0;
+            const uint64_t counts_bytes = (uint64_t)sort_expert_count * sizeof(uint32_t);
+            const uint64_t offsets_bytes = ((uint64_t)sort_expert_count + 1ull) * sizeof(uint32_t);
+            const uint64_t cursors_bytes = (uint64_t)sort_expert_count * sizeof(uint32_t);
             const uint64_t sorted_bytes = (uint64_t)pair_count * sizeof(uint32_t);
-            tile_capacity = (pair_count + expert_tile_m - 1u) / expert_tile_m + 256u;
-            tile16_capacity = use_down_tile16 ? ((pair_count + 15u) / 16u + 256u) : 0u;
-            const uint64_t tile_offsets_bytes = 257ull * sizeof(uint32_t);
+            tile_capacity = (pair_count + expert_tile_m - 1u) / expert_tile_m + sort_expert_count;
+            tile16_capacity = use_down_tile16 ? ((pair_count + 15u) / 16u + sort_expert_count) : 0u;
+            const uint64_t tile_offsets_bytes = ((uint64_t)sort_expert_count + 1ull) * sizeof(uint32_t);
             const uint64_t tile_total_bytes = sizeof(uint32_t);
             const uint64_t tile_experts_bytes = (uint64_t)tile_capacity * sizeof(uint32_t);
             const uint64_t tile_starts_bytes = (uint64_t)tile_capacity * sizeof(uint32_t);
-            const uint64_t tile16_offsets_bytes = use_down_tile16 ? 257ull * sizeof(uint32_t) : 0u;
+            const uint64_t tile16_offsets_bytes = use_down_tile16 ? ((uint64_t)sort_expert_count + 1ull) * sizeof(uint32_t) : 0u;
             const uint64_t tile16_total_bytes = use_down_tile16 ? sizeof(uint32_t) : 0u;
             const uint64_t tile16_experts_bytes = (uint64_t)tile16_capacity * sizeof(uint32_t);
             const uint64_t tile16_starts_bytes = (uint64_t)tile16_capacity * sizeof(uint32_t);
@@ -14127,7 +14172,7 @@ static int routed_moe_launch(
                     ok = cuda_ok(cudaGetLastError(), "routed_moe sorted count launch");
                 }
                 if (ok) {
-                    moe_prefix_sorted_pairs_kernel<<<1, 1>>>(offsets, cursors, counts);
+                    moe_prefix_sorted_pairs_kernel<<<1, 1>>>(offsets, cursors, counts, sort_expert_count);
                     ok = cuda_ok(cudaGetLastError(), "routed_moe sorted prefix launch");
                 }
                 if (ok) {
@@ -14139,19 +14184,19 @@ static int routed_moe_launch(
                     ok = cuda_ok(cudaGetLastError(), "routed_moe sorted scatter launch");
                 }
                 if (ok && use_expert_tiles) {
-                    moe_build_expert_tile_offsets_kernel<<<1, 1>>>(tile_offsets, tile_total, counts, expert_tile_m);
+                    moe_build_expert_tile_offsets_kernel<<<1, 1>>>(tile_offsets, tile_total, counts, sort_expert_count, expert_tile_m);
                     ok = cuda_ok(cudaGetLastError(), "routed_moe expert tile offsets launch");
                 }
                 if (ok && use_expert_tiles) {
-                    moe_build_expert_tiles_kernel<<<1, 256>>>(tile_experts, tile_starts, tile_offsets, counts, expert_tile_m);
+                    moe_build_expert_tiles_kernel<<<(sort_expert_count + 255u) / 256u, 256>>>(tile_experts, tile_starts, tile_offsets, counts, sort_expert_count, expert_tile_m);
                     ok = cuda_ok(cudaGetLastError(), "routed_moe expert tiles launch");
                 }
                 if (ok && use_expert_tiles && use_down_tile16) {
-                    moe_build_expert_tile_offsets_kernel<<<1, 1>>>(tile16_offsets, tile16_total, counts, 16u);
+                    moe_build_expert_tile_offsets_kernel<<<1, 1>>>(tile16_offsets, tile16_total, counts, sort_expert_count, 16u);
                     ok = cuda_ok(cudaGetLastError(), "routed_moe expert tile16 offsets launch");
                 }
                 if (ok && use_expert_tiles && use_down_tile16) {
-                    moe_build_expert_tiles_kernel<<<1, 256>>>(tile16_experts, tile16_starts, tile16_offsets, counts, 16u);
+                    moe_build_expert_tiles_kernel<<<(sort_expert_count + 255u) / 256u, 256>>>(tile16_experts, tile16_starts, tile16_offsets, counts, sort_expert_count, 16u);
                     ok = cuda_ok(cudaGetLastError(), "routed_moe expert tile16 launch");
                 }
             }
