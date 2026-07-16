@@ -19860,6 +19860,16 @@ static bool metal_graph_encode_layer_ffn_batch(
     }
 #endif
 
+    if (ok && g->ssd_streaming) {
+        ok = metal_graph_cuda_stream_prefill_batch_selected_load(g,
+                                                                 model,
+                                                                 layer,
+                                                                 il,
+                                                                 n_tokens,
+                                                                 gate_expert_bytes,
+                                                                 down_expert_bytes);
+    }
+
     if (ok) {
         ok = ds4_gpu_routed_moe_batch_tensor(metal_graph_batch_routed_out(g),
                                                metal_graph_batch_routed_gate(g),
@@ -19920,18 +19930,6 @@ static bool metal_graph_encode_layer_ffn_batch(
     }
 #undef DS4_METAL_ENCODE_PREFILL_SHARED_EXPERT
 #undef DS4_METAL_TRY_SHARED_DOWN_F16
-
-
-    if (ok && g->ssd_streaming) {
-        ok = metal_graph_cuda_stream_prefill_batch_selected_load(g,
-                                                                 model,
-                                                                 layer,
-                                                                 il,
-                                                                 n_tokens,
-                                                                 gate_expert_bytes,
-                                                                 down_expert_bytes);
-    }
-
 
     if (ok && keep_ffn_out) {
         ok = metal_graph_ensure_batch_ffn_out(g) &&

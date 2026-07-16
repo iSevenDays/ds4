@@ -14118,7 +14118,7 @@ static int routed_moe_launch(
         if (prof_ev[1]) (void)cudaEventRecord(prof_ev[1], 0);
         if (ok && use_sorted_pairs) {
             const uint32_t sort_expert_count =
-                use_stream_selected_cache ? g_stream_selected_cache.compact_count :
+                use_stream_selected_cache ? ssd_current()->selected_cache.compact_count :
                 n_total_expert;
             if (sort_expert_count == 0) ok = 0;
             const uint64_t counts_bytes = (uint64_t)sort_expert_count * sizeof(uint32_t);
