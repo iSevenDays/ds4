@@ -10871,6 +10871,23 @@ static bool metal_graph_set_active_tier_batch(ds4_gpu_graph *g, int tier, uint32
     return true;
 }
 
+/* SSD streaming producer/consumer device re-affirmation. The per-layer
+ * dispatcher (metal_graph_set_active_tier_*) sets the CUDA device to the
+ * layer's home tier at layer entry, but the ambient device can drift back
+ * to tier 0 across the attention/router kernels that run before the SSD
+ * producer (the resident path tolerates drift because each kernel re-sets
+ * its own device; SSD allocation does not). Call this right before any
+ * SSD producer stages data for layer `il` so ssd_current() resolves to the
+ * layer's home tier and the staging lands on the right device. No-op for
+ * single-tier (placement == NULL). */
+static inline void metal_graph_ssd_assert_tier_device(const ds4_gpu_graph *g,
+                                                       uint32_t il) {
+    if (g && g->placement) {
+        const int tier = g->placement[il + 1];
+        if (tier >= 0) (void)ds4_gpu_set_current_device(tier);
+    }
+}
+
 /* Fork-only Class P accessor for the Q8_K compressor staging buffer.
  * Mirrors the DS4_GPU_GRAPH_CLASS_P_ACCESSOR macro pattern but stays
  * separate because the symbol predates the macro block. */
@@ -14210,6 +14227,7 @@ static bool metal_graph_decode_set_hash_selected_override(
         }
         const uint64_t gate_expert_bytes = gate_tensor_bytes / DS4_N_EXPERT;
         const uint64_t down_expert_bytes = down_tensor_bytes / DS4_N_EXPERT;
+        metal_graph_ssd_assert_tier_device(g, il);
         if (ds4_gpu_stream_expert_cache_begin_selected_load(
                     model->map,
                     model->size,
@@ -14392,6 +14410,7 @@ static bool metal_graph_decode_selected_readahead_override(
                                                  DS4_N_EXPERT_USED) == 0) {
         return false;
     }
+    metal_graph_ssd_assert_tier_device(g, il);
     if (ds4_gpu_stream_expert_cache_begin_selected_load(
                 model->map,
                 model->size,
@@ -14479,6 +14498,7 @@ static void metal_graph_selected_async_load_run(
             return;
         }
     }
+    metal_graph_ssd_assert_tier_device(job->g, job->il);
     if (ds4_gpu_stream_expert_cache_begin_selected_load(
                 job->model->map,
                 job->model->size,
@@ -15633,6 +15653,7 @@ static bool metal_graph_encode_decode_layer(
                  ds4_gpu_routed_moe_set_selected_override(selected_ids,
                                                           DS4_N_EXPERT_USED) != 0;
             if (ok) {
+                metal_graph_ssd_assert_tier_device(g, il);
                 ok = ds4_gpu_stream_expert_cache_begin_selected_load(
                             model->map,
                             model->size,
@@ -18639,6 +18660,7 @@ static bool metal_graph_cuda_stream_prefill_batch_selected_load(
                                   n_ids64 * sizeof(selected_ids[0])) != 0;
     const double t_read = profile ? now_sec() : 0.0;
     if (ok) {
+        metal_graph_ssd_assert_tier_device(g, il);
         ok = ds4_gpu_stream_expert_cache_prepare_selected_batch(
                     model->map,
                     model->size,
@@ -19587,6 +19609,7 @@ static bool metal_graph_seed_streaming_expert_cache_from_prefill(
             const size_t sel_off = ((size_t)il *
                                     DS4_STREAMING_PREFILL_CACHE_SEED_MAX_TOKENS +
                                     row) * DS4_N_EXPERT_USED;
+            metal_graph_ssd_assert_tier_device(g, il);
             if (ds4_gpu_stream_expert_cache_seed_selected(
                         model->map,
                         model->size,
@@ -19710,6 +19733,7 @@ static bool metal_graph_seed_streaming_expert_cache_from_hotlist(
         }
         const uint64_t gate_expert_bytes = layer->ffn_gate_exps->dim[1] * gate_row_bytes;
         const uint64_t down_expert_bytes = layer->ffn_down_exps->dim[1] * down_row_bytes;
+        metal_graph_ssd_assert_tier_device(g, il);
         if (ds4_gpu_stream_expert_cache_seed_experts(
                     model->map,
                     model->size,
@@ -25323,6 +25347,32 @@ static bool ds4_engine_preload_pro_q4_expert_tables(
 
 /* Classify each model tensor by its placement entry. Tensor names live
  * in ds4_str slices (ptr+len), NOT NUL-terminated. */
+static int tensor_to_entry(const ds4_tensor *t, int n_layer);
+
+/* Returns true if the tensor is a routed-expert weight that SSD streaming
+ * serves from host/disk instead of resident VRAM. When SSD streaming is
+ * enabled these tensors MUST be excluded from the multi-tier placement
+ * budget (they are not loaded resident — a small per-tier LRU expert cache
+ * is grown lazily at runtime out of each tier's free VRAM). The names are
+ * the flat ds4_tensor slice form of "blk.<il>.{ffn_gate_exps,ffn_up_exps,
+ * ffn_down_exps}.weight" (and the mtp.* mirrors). Suffix-matched so the
+ * "blk.<il>." / "mtp.0." prefix does not matter. */
+static bool tensor_is_ssd_streamed_routed_expert(const ds4_tensor *t) {
+    const char *p = t->name.ptr;
+    int n = (int)t->name.len;
+    if (n <= 0 || !p) return false;
+    static const char k_gate[]  = ".ffn_gate_exps.weight";
+    static const char k_up[]    = ".ffn_up_exps.weight";
+    static const char k_down[]  = ".ffn_down_exps.weight";
+    const size_t ng  = sizeof(k_gate) - 1;
+    const size_t nu  = sizeof(k_up) - 1;
+    const size_t nd  = sizeof(k_down) - 1;
+    if ((size_t)n >= ng && memcmp(p + n - ng, k_gate, ng) == 0) return true;
+    if ((size_t)n >= nu && memcmp(p + n - nu, k_up,   nu) == 0) return true;
+    if ((size_t)n >= nd && memcmp(p + n - nd, k_down, nd) == 0) return true;
+    return false;
+}
+
 static int tensor_to_entry(const ds4_tensor *t, int n_layer) {
     const char *p = t->name.ptr;
     int n = (int)t->name.len;
@@ -25623,9 +25673,20 @@ static int engine_compute_entry_bytes(const ds4_engine *e, size_t *out) {
     const int n_entries = DS4_N_LAYER + 2;
     for (int i = 0; i < n_entries; i++) out[i] = 0;
 
+    /* When SSD streaming is on, the routed-expert weights (the bulk of an
+     * MoE model) are served from host/disk by the per-tier SSD caches, not
+     * loaded resident. Exclude them from the placement budget so the packer
+     * sizes only dense weights + KV; the per-tier expert cache is grown
+     * lazily at runtime out of each tier's free VRAM (and self-caps via
+     * cudaMemGetInfo). Without this, the packer refuses CPU-spill for a
+     * model whose routed experts were never going to be resident anyway. */
+    const bool ssd_excludes_routed = e->ssd_streaming;
     for (uint64_t i = 0; i < e->model.n_tensors; i++) {
         const ds4_tensor *t = &e->model.tensors[i];
         if (t->bytes == 0) continue;
+        if (ssd_excludes_routed && tensor_is_ssd_streamed_routed_expert(t)) {
+            continue;
+        }
         int entry = tensor_to_entry(t, DS4_N_LAYER);
         if (entry < 0 || entry >= n_entries) entry = 0;
         out[entry] += t->bytes;
@@ -25639,6 +25700,58 @@ static int engine_compute_entry_bytes(const ds4_engine *e, size_t *out) {
                                                     e->prefill_chunk);
     }
     return 0;
+}
+
+/* Rewrite e->placement[] for SSD streaming: split the transformer layer
+ * range (entries 1..DS4_N_LAYER) into CONTIGUOUS ranges across the
+ * cfg->n_gpus GPUs in proportion to each GPU's vram_bytes share. Token
+ * embedding (entry 0) stays on tier 0; the output head (entry n_layers+1)
+ * follows the last tier that owns a transformer layer.
+ *
+ * Why: with SSD streaming the routed-expert weights (the bulk of an MoE
+ * model) are served per-tier from SSD, so the dense-weight-only budget
+ * computed by engine_compute_entry_bytes is small and the greedy packer
+ * would collapse everything onto tier 0. Balancing the layer range shares
+ * the streaming work evenly across every GPU the user requested.
+ *
+ * Dense weights (attention + shared expert + norms) are small relative to
+ * any reasonable --gpu-vram budget, so this contiguous split never spills
+ * to CPU. e->n_placement_entries and e->multi_tier are updated in place. */
+static void engine_balance_placement_for_ssd(ds4_engine *e,
+                                              const ds4_gpu_config *cfg) {
+    const int n_gpus = cfg->n_gpus;
+    const int n_layers = DS4_N_LAYER;
+    if (n_gpus < 2 || n_layers < 1) return;
+
+    double total = 0.0;
+    for (int d = 0; d < n_gpus; d++) total += (double)cfg->vram_bytes[d];
+    if (total <= 0) return;
+
+    /* Entry 0 (token embedding) on tier 0. */
+    e->placement[0] = 0;
+
+    /* Walk transformer layers in order, assigning each to the tier whose
+     * cumulative budget share covers this layer's fractional position. This
+     * yields contiguous, budget-proportional ranges. */
+    int t = 0;
+    double cumulative = (double)cfg->vram_bytes[0];
+    for (int i = 1; i <= n_layers; i++) {
+        const double layer_frac = (double)i / (double)n_layers;
+        while (t + 1 < n_gpus && layer_frac > cumulative / total) {
+            t++;
+            cumulative += (double)cfg->vram_bytes[t];
+        }
+        e->placement[i] = t;
+    }
+
+    /* Output head (entry n_layers+1) on the highest tier that owns a layer. */
+    int last_tier = 0;
+    for (int i = 1; i <= n_layers; i++) {
+        if (e->placement[i] > last_tier) last_tier = e->placement[i];
+    }
+    e->placement[n_layers + 1] = last_tier;
+    e->n_placement_entries = n_layers + 2;
+    e->multi_tier = last_tier > 0 ? 1 : 0;
 }
 
 /* Classify multi-tier placement on a freshly-opened engine. NULL config
@@ -25687,6 +25800,19 @@ static int engine_classify_multi_tier(ds4_engine *e, const ds4_gpu_config *cfg) 
         return -1;
     }
     e->n_placement_entries = DS4_N_LAYER + 2;
+
+    /* SSD streaming rebalance: the greedy packer fills tier 0 first, so with
+     * routed experts excluded from the resident budget (engine_compute_entry_
+     * bytes) the small dense footprint collapses onto tier 0 and the other
+     * requested GPUs sit idle. But routed experts stream per-tier from SSD,
+     * so the layer RANGE — and thus the streaming work — must be balanced
+     * across every GPU the user requested. Rewrite placement[] with a
+     * contiguous, budget-proportional split when SSD streaming is on and the
+     * user asked for more than one GPU. Dense weights are tiny relative to
+     * the per-tier budget, so this never causes CPU-spill. */
+    if (e->ssd_streaming && cfg->n_gpus >= 2) {
+        engine_balance_placement_for_ssd(e, cfg);
+    }
 
     int first_tier = e->placement[0];
     int multi_tier = 0;
@@ -25764,9 +25890,15 @@ static int engine_install_per_device_caches(ds4_engine *e) {
     int per_dev_cap[DS4_MAX_GPUS] = {0};
 
     int rc = -1;
+    const bool ssd_skip_routed = e->ssd_streaming;
     for (uint64_t i = 0; i < e->model.n_tensors; i++) {
         const ds4_tensor *t = &e->model.tensors[i];
         if (t->bytes == 0) continue;
+        /* SSD streaming: routed-expert weights stream per-tier from the host
+         * mmap via the per-tier SSD caches; do NOT register them resident on
+         * each device (would blow the budget and defeat streaming). Only the
+         * dense weights (attention, shared expert, norms) are loaded resident. */
+        if (ssd_skip_routed && tensor_is_ssd_streamed_routed_expert(t)) continue;
         int entry = tensor_to_entry(t, DS4_N_LAYER);
         if (entry < 0 || entry >= e->n_placement_entries) entry = 0;
         int logical_tier = e->placement[entry];
@@ -26146,10 +26278,10 @@ static int ds4_engine_open_internal(ds4_engine **out,
         *out = NULL;
         return 1;
     }
-    /* SSD streaming is supported on CUDA (single-tier path). Multi-GPU SSD
-     * streaming (per-device caches/streams) is wired in a later milestone;
-     * until then a multi-tier request with --ssd-streaming falls back to the
-     * normal resident placement. */
+    /* SSD streaming is supported on CUDA both single-tier and multi-tier.
+     * Per-tier caches/streams are resolved via ssd_current() (cudaGetDevice)
+     * in ds4_cuda.cu; the multi-tier init branch wires
+     * ds4_gpu_set_ssd_streaming after ds4_gpu_init_multi populates g_gpu[]. */
     const char *expert_profile_path = opt->expert_profile_path;
     if (!expert_profile_path || !expert_profile_path[0]) {
         expert_profile_path = getenv("DS4_EXPERT_PROFILE");
@@ -26288,6 +26420,26 @@ static int ds4_engine_open_internal(ds4_engine **out,
             }
             e->metal_ready = true;
             ds4_gpu_set_quality(e->quality);
+            /* SSD streaming: now that ds4_gpu_init_multi has populated g_gpu[],
+             * enable SSD per tier. ds4_gpu_set_ssd_streaming loops every tier,
+             * cudaSetDevice()ing to each so ssd_current() in the release/reset
+             * helpers resolves to g_ssd[t]; the LRU is sized lazily per device
+             * on first use (cudaMemGetInfo on the current device). */
+            ds4_gpu_set_ssd_streaming(e->ssd_streaming);
+            if (!ds4_engine_configure_streaming_auto_cache(e)) {
+                ds4_engine_close(e);
+                *out = NULL;
+                return 1;
+            }
+            ds4_gpu_set_streaming_expert_cache_budget(e->ssd_streaming_cache_experts);
+            if (e->ssd_streaming) {
+                /* Pin the expert cache's slab size class to the model's uniform
+                 * per-expert bytes (mirrors the single-tier branch). */
+                uint64_t slab_expert_bytes = 0;
+                if (ds4_streaming_routed_expert_bytes(&e->weights, &slab_expert_bytes)) {
+                    ds4_gpu_set_streaming_expert_cache_expert_bytes(slab_expert_bytes);
+                }
+            }
             (void)ds4_gpu_set_model_fd(e->model.fd);
             if (engine_install_gpu_placement(e) != 0) {
                 ds4_engine_close(e);
