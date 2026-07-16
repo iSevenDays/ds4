@@ -118,6 +118,18 @@ static bool ds4_backend_uses_graph(ds4_backend backend) {
     return backend == DS4_BACKEND_METAL || backend == DS4_BACKEND_CUDA;
 }
 
+static bool ds4_backend_supports_ssd_streaming(ds4_backend backend) {
+    if (backend == DS4_BACKEND_METAL) return true;
+    if (backend == DS4_BACKEND_CUDA) {
+#if defined(DS4_ROCM_BUILD) || (!defined(DS4_NO_GPU) && !defined(__APPLE__))
+        return true;
+#else
+        return false;
+#endif
+    }
+    return false;
+}
+
 /* =========================================================================
  * DeepSeek V4 Shape Profiles.
  * =========================================================================
@@ -25990,12 +26002,10 @@ static int ds4_engine_open_internal(ds4_engine **out,
     if (opt->warm_weights) model_warm_weights(&e->model);
     if (!opt->inspect_only) vocab_load(&e->vocab, &e->model);
     config_validate_model(&e->model);
-    if (e->ssd_streaming && e->backend != DS4_BACKEND_METAL) {
-        fprintf(stderr, "ds4: --ssd-streaming is currently supported only with --metal\n");
-        ds4_engine_close(e);
-        *out = NULL;
-        return 1;
-    }
+    /* SSD streaming is supported on CUDA (single-tier path). Multi-GPU SSD
+     * streaming (per-device caches/streams) is wired in a later milestone;
+     * until then a multi-tier request with --ssd-streaming falls back to the
+     * normal resident placement. */
     const char *expert_profile_path = opt->expert_profile_path;
     if (!expert_profile_path || !expert_profile_path[0]) {
         expert_profile_path = getenv("DS4_EXPERT_PROFILE");
