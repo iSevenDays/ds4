@@ -14172,6 +14172,7 @@ static uint32_t metal_graph_streaming_expert_preload_count(
 static bool metal_graph_decode_set_hash_selected_override(
         const ds4_model         *model,
         const ds4_layer_weights *layer,
+        uint32_t                 il,
         uint32_t                 token,
         uint64_t                 gate_tensor_bytes,
         uint64_t                 down_tensor_bytes,
@@ -14194,6 +14195,35 @@ static bool metal_graph_decode_set_hash_selected_override(
     layer_hash_selected_experts(selected, model, layer, (int)token);
     for (uint32_t i = 0; i < DS4_N_EXPERT_USED; i++) {
         selected_i32[i] = (int32_t)selected[i];
+    }
+    /* SSD streaming: stage the hash-selected experts into the resident device
+     * cache before the routed-MoE matmul consumes them.  This is the producer
+     * for models with ffn_gate_tid2eid (where the overlap/readahead decode
+     * branches are disabled because they require tid2eid == NULL).  Ported
+     * from main which uses graph_stream_expert_table_make + table-struct API;
+     * q4k uses the equivalent flat raw-argument signature. */
+    if (g && g->ssd_streaming) {
+        if (DS4_N_EXPERT == 0 ||
+            gate_tensor_bytes % DS4_N_EXPERT != 0 ||
+            down_tensor_bytes % DS4_N_EXPERT != 0) {
+            return false;
+        }
+        const uint64_t gate_expert_bytes = gate_tensor_bytes / DS4_N_EXPERT;
+        const uint64_t down_expert_bytes = down_tensor_bytes / DS4_N_EXPERT;
+        if (ds4_gpu_stream_expert_cache_begin_selected_load(
+                    model->map,
+                    model->size,
+                    il,
+                    selected_i32,
+                    DS4_N_EXPERT,
+                    DS4_N_EXPERT_USED,
+                    layer->ffn_gate_exps->abs_offset,
+                    layer->ffn_up_exps->abs_offset,
+                    layer->ffn_down_exps->abs_offset,
+                    gate_expert_bytes,
+                    down_expert_bytes) == 0) {
+            return false;
+        }
     }
     return ds4_gpu_routed_moe_set_selected_override(selected_i32, DS4_N_EXPERT_USED) != 0;
 }
@@ -15355,6 +15385,7 @@ static bool metal_graph_encode_decode_layer(
                                                     metal_graph_router_logits(g)) != 0;
         if (ok) ok = metal_graph_decode_set_hash_selected_override(model,
                                                                    layer,
+                                                                   il,
                                                                    (uint32_t)token,
                                                                    layer->ffn_gate_exps->bytes,
                                                                    layer->ffn_down_exps->bytes,
@@ -15700,14 +15731,12 @@ static bool metal_graph_encode_decode_layer(
         }
         return ok;
     }
-    /* NOTE: SSD streaming routed-MoE on the decode fallback path (neither
-     * selected_readahead_shared_delay nor overlap_selected_shared) is not yet
-     * wired: this path has no expert-staging producer, so g_stream_selected_cache
-     * stays invalid and the matmul falls back to cuda_resolve_weight_ptr.  In
-     * batched-SSD-decode mode (the default) a synchronous producer cannot be
-     * inserted here without breaking the single command buffer.  Enabling one
-     * of the async-overlap branches (or disabling layer batching) is the
-     * follow-up; tracked as the next milestone. */
+    /* SSD streaming decode fallback path (neither selected_readahead_shared_delay
+     * nor overlap_selected_shared).  For models with ffn_gate_tid2eid the
+     * overlap/readahead branches require tid2eid == NULL and are therefore
+     * disabled; expert staging for this path is performed upstream in
+     * metal_graph_decode_set_hash_selected_override(), which populates
+     * g_stream_selected_cache so the matmul below reads staged device pointers. */
     if (ok) ok = ds4_gpu_routed_moe_one_tensor(metal_graph_routed_out(g),
                                                  metal_graph_routed_gate(g),
                                                  metal_graph_routed_up(g),
