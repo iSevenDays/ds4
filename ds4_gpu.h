@@ -54,6 +54,10 @@ int ds4_gpu_tensor_read_after_selected_event(const ds4_gpu_tensor *tensor,
 int ds4_gpu_end_commands(void);
 int ds4_gpu_synchronize(void);
 
+/* Debug probe (ds4_cuda.cu): logs ambient device vs expected tier device and
+ * any pending CUDA error after a forced sync. Gated by DS4_SSD_DEBUG. */
+int ds4_gpu_debug_probe(const char *where, int il, int tier);
+
 int ds4_gpu_set_model_map(const void *model_map, uint64_t model_size);
 int ds4_gpu_set_model_fd(int fd);
 int ds4_gpu_set_model_fd_for_map(int fd, const void *model_map);

@@ -11004,6 +11004,14 @@ static inline int ds4_gpu_tensor_copy_xdev(ds4_gpu_tensor *dst,
 }
 #endif
 
+/* Multi-GPU + SSD-staging debug trace gate (matches ds4_cuda.cu). Default off
+ * in production; set DS4_SSD_DEBUG=1 to enable the per-step prefill trace. */
+static int ds4_ssd_dbg(void) {
+    static int e = -1;
+    if (e < 0) { const char *s = getenv("DS4_SSD_DEBUG"); e = (s && s[0] == '1') ? 1 : 0; }
+    return e;
+}
+
 /* Returns true on success. Single-tier: no-op success. Multi-tier:
  * sets the CUDA device, then if tier differs from current active_tier,
  * copies cur_hc to the destination tier and updates active_tier. */
@@ -11038,16 +11046,23 @@ static bool metal_graph_set_active_tier_batch(ds4_gpu_graph *g, int tier, uint32
         return true;
     }
     if (tier < 0 || tier >= DS4_MAX_GPUS) return false;
+    (void)ds4_gpu_debug_probe("set_active_tier_batch entry", -1, tier);
     if (ds4_gpu_set_current_device(tier) != 0) return false;
     if (tier == g->active_tier) return true;
     ds4_gpu_tensor *src = g->batch_cur_hc_by_tier[g->active_tier];
     ds4_gpu_tensor *dst = g->batch_cur_hc_by_tier[tier];
+    if (ds4_ssd_dbg()) {
+        fprintf(stderr, "ds4[probe] set_active_tier_batch hop %d->%d chunk=%u src=%p dst=%p\n",
+                g->active_tier, tier, chunk_tokens, (void*)src, (void*)dst);
+        fflush(stderr);
+    }
     if (src && dst) {
         const uint64_t hc_bytes =
             (uint64_t)chunk_tokens * DS4_N_HC * DS4_N_EMBD * sizeof(float);
         if (!ds4_gpu_tensor_copy_xdev(dst, src, hc_bytes)) return false;
     }
     g->active_tier = tier;
+    (void)ds4_gpu_debug_probe("set_active_tier_batch done", -1, tier);
     return true;
 }
 
@@ -19994,26 +20009,24 @@ static bool metal_graph_encode_layer_batch(
         uint32_t                n_tokens) {
     /* Half-B (B6): switch to this layer's home tier before any Class P
      * accessor reads. Single-tier (placement == NULL): no-op. */
+    int this_tier = g->placement ? g->placement[il + 1] : 0;
+    (void)ds4_gpu_debug_probe("encode_layer_batch entry", (int)il, this_tier);
     if (g->placement) {
-        const int this_tier = g->placement[il + 1];
         if (!metal_graph_set_active_tier_batch(g, this_tier, n_tokens)) return false;
     }
+    (void)ds4_gpu_debug_probe("encode_layer_batch pre-attn", (int)il, this_tier);
     bool ok = metal_graph_encode_layer_attention_batch(g, model, layer, il, pos0, n_tokens);
     if (!ok) {
         fprintf(stderr, "ds4: gpu layer %u attention batch encode failed\n", il);
     }
+    (void)ds4_gpu_debug_probe("encode_layer_batch post-attn", (int)il, this_tier);
     if (ok) {
         ok = metal_graph_encode_layer_ffn_batch(g, model, layer, il, pos0, n_tokens);
         if (!ok) {
             fprintf(stderr, "ds4: gpu layer %u ffn batch encode failed\n", il);
         }
     }
-    if (ok) {
-        ok = metal_graph_encode_layer_ffn_batch(g, model, layer, il, pos0, n_tokens);
-        if (!ok) {
-            fprintf(stderr, "ds4: gpu layer %u ffn batch encode failed\n", il);
-        }
-    }
+    (void)ds4_gpu_debug_probe("encode_layer_batch post-ffn", (int)il, this_tier);
     if (ok) {
         ds4_gpu_tensor *tmp = metal_graph_batch_cur_hc(g);
         g->batch_cur_hc_by_tier[g->active_tier] = metal_graph_batch_next_hc(g);
@@ -21024,12 +21037,20 @@ static bool metal_graph_reset_prefill_state(ds4_gpu_graph *g) {
     memset(g->layer_n_comp, 0, sizeof(g->layer_n_comp));
     memset(g->layer_n_index_comp, 0, sizeof(g->layer_n_index_comp));
     g->mtp_n_raw = 0;
+    int prev_active = g->active_tier;
+    if (ds4_ssd_dbg()) {
+        fprintf(stderr, "ds4[probe] reset_prefill_state ENTER active_tier=%d emb_tier=%d placement=%p\n",
+                prev_active, g->emb_tier, (void*)g->placement);
+        fflush(stderr);
+    }
     for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
         const uint32_t ratio = ds4_layer_compress_ratio(il);
         if (ratio == 0) continue;
         const uint32_t coff = ratio == 4 ? 2u : 1u;
         const uint64_t attn_width = (uint64_t)coff * DS4_N_HEAD_DIM;
         const uint64_t attn_rows = (uint64_t)coff * ratio;
+        int home_tier = g->placement ? g->placement[il + 1] : 0;
+        (void)ds4_gpu_debug_probe("reset_prefill pre-fill", (int)il, home_tier);
         if (!metal_tensor_fill_f32(g->layer_attn_state_kv[il], 0.0f, attn_width * attn_rows)) return false;
         if (!metal_tensor_fill_f32(g->layer_attn_state_score[il], DS4_NEG_INF, attn_width * attn_rows)) return false;
         if (ratio == 4) {
@@ -21039,6 +21060,7 @@ static bool metal_graph_reset_prefill_state(ds4_gpu_graph *g) {
             if (!metal_tensor_fill_f32(g->layer_index_state_score[il], DS4_NEG_INF, index_width * index_rows)) return false;
         }
     }
+    (void)ds4_gpu_debug_probe("reset_prefill post-all", -1, prev_active);
     return true;
 }
 
@@ -21102,6 +21124,7 @@ static bool metal_graph_prefill_layer_major(
     double execute_s = 0.0;
 
     if (!split_commands) {
+        if (g->placement && g->active_tier != g->emb_tier) g->active_tier = g->emb_tier;
         ok = metal_graph_upload_prompt_embeddings_hc(metal_graph_batch_cur_hc(g),
                                                      metal_graph_prefill_tokens(g),
                                                      model,
@@ -21237,6 +21260,28 @@ static bool metal_graph_prefill_layer_major(
     }
 
     double t_layer0 = (profile || throttle) ? now_sec() : 0.0;
+    (void)ds4_gpu_debug_probe("prefill pre-embed upload", -1, g->active_tier);
+    if (ds4_ssd_dbg()) {
+        fprintf(stderr, "ds4[probe] prefill embed: active_tier=%d emb_tier=%d n_tokens=%u start=%u\n",
+                g->active_tier, g->emb_tier, n_tokens, start);
+        fflush(stderr);
+    }
+    /* The batch embedding kernel reads prefill_tokens (staged on emb_tier) and
+     * the token_embd weight (staged on emb_tier) and must run on emb_tier's
+     * device. After a decode, active_tier is left on the head tier (tier 1
+     * here), so batch_cur_hc would otherwise resolve to a different tier than
+     * prefill_tokens: the embedding kernel would launch on out_hc's device
+     * while dereferencing a device-0 tokens pointer -> illegal memory access.
+     * Repoint active_tier at emb_tier (no boundary-hop copy is needed: the
+     * embed overwrites batch_cur_hc in full). */
+    if (g->placement && g->active_tier != g->emb_tier) {
+        if (ds4_ssd_dbg()) {
+            fprintf(stderr, "ds4[probe] prefill embed: repoint active_tier %d -> emb_tier %d\n",
+                    g->active_tier, g->emb_tier);
+            fflush(stderr);
+        }
+        g->active_tier = g->emb_tier;
+    }
     ok = metal_graph_upload_prompt_embeddings_hc(metal_graph_batch_cur_hc(g),
                                                  metal_graph_prefill_tokens(g),
                                                  model,
@@ -21244,6 +21289,7 @@ static bool metal_graph_prefill_layer_major(
                                                  prompt,
                                                  start,
                                                  n_tokens);
+    (void)ds4_gpu_debug_probe("prefill post-embed upload", -1, g->active_tier);
     const double t_embed_encoded = (profile || throttle) ? now_sec() : 0.0;
     const double t_embed_done = (profile || throttle) ? now_sec() : 0.0;
     if (profile) {
@@ -21845,6 +21891,7 @@ static bool metal_graph_verify_suffix_tops(
     if (top_rows && !row_tops) return false;
 
     bool ok = metal_graph_upload_prompt_tokens(metal_graph_prefill_tokens(g), prompt, start, n_tokens);
+    if (g->placement && g->active_tier != g->emb_tier) g->active_tier = g->emb_tier;
     if (ok) ok = metal_graph_upload_prompt_embeddings_hc(metal_graph_batch_cur_hc(g),
                                                          metal_graph_prefill_tokens(g),
                                                          model,
@@ -28148,6 +28195,7 @@ int ds4_session_eval_layer_slice(ds4_session *s,
     };
 
     bool ok = metal_graph_upload_prompt_tokens(metal_graph_prefill_tokens(g), &span, 0, n_tokens);
+    if (g->placement && g->active_tier != g->emb_tier) g->active_tier = g->emb_tier;
     if (ok && input_hc) {
         ok = ds4_gpu_tensor_write(metal_graph_batch_cur_hc(g), 0, input_hc, hc_bytes) != 0;
     } else if (ok) {

@@ -1264,6 +1264,44 @@ static double cuda_wall_sec(void) {
     return (double)ts.tv_sec + (double)ts.tv_nsec * 1.0e-9;
 }
 
+/* =========================================================================
+ * Debug probe for the multi-GPU + SSD-staging fault investigation.
+ *
+ * Gate with DS4_SSD_DEBUG=1 (default OFF in production now that the fault is
+ * fixed). Logs the ambient CUDA device, the expected physical device for
+ * `tier`, the logical tier, the layer, and any pending CUDA error. To catch
+ * *lazy* async illegal-memory-access errors promptly, it forces a
+ * cudaDeviceSynchronize() before sampling cudaGetLastError(); this is
+ * expensive, so it is opt-in.
+ *
+ * NB: cudaGetLastError() *clears* the sticky error, so a subsequent cuda_ok()
+ * will not _exit() on it — i.e. enabling DS4_SSD_DEBUG effectively suspends
+ * fail-fast so the full prefill trace can be captured. The CUDA context is
+ * still poisoned, so later ops will re-report and the trace is still
+ * terminal; we just get to see every step instead of dying on the first one.
+ * Returns the (cleared) cudaError_t ordinal, or 0 on success (or when off). */
+static bool ds4_ssd_debug_on(void) {
+    static int e = -1;
+    if (e < 0) { const char *s = getenv("DS4_SSD_DEBUG"); e = (s && s[0] == '1') ? 1 : 0; }
+    return e != 0;
+}
+
+extern "C" int ds4_gpu_debug_probe(const char *where, int il, int tier) {
+    int dev = -1;
+    (void)cudaGetDevice(&dev);
+    int phys = (tier >= 0 && tier < g_n_gpus) ? g_gpu[tier].device_id : -99;
+    if (!ds4_ssd_debug_on()) return 0;
+    cudaError_t sync_err = cudaDeviceSynchronize();
+    cudaError_t err = cudaGetLastError();
+    if (sync_err != cudaSuccess && err == cudaSuccess) err = sync_err;
+    fprintf(stderr,
+            "ds4[probe] %-30s il=%-3u tier=%d phys_dev=%d ambient_dev=%d n_gpus=%d err=%d%s%s\n",
+            where ? where : "?", (unsigned)il, tier, phys, dev, g_n_gpus,
+            (int)err, err ? " :: " : "", err ? cudaGetErrorString(err) : "");
+    fflush(stderr);
+    return (int)err;
+}
+
 static int cuda_model_load_progress_enabled(void) {
     if (getenv("DS4_CUDA_WEIGHT_CACHE_VERBOSE") != NULL) return 0;
     return 1;
@@ -3333,6 +3371,15 @@ extern "C" int ds4_gpu_tensor_copy_xdev(ds4_gpu_tensor *dst,
     if (bytes > dst->bytes || bytes > src->bytes) return 0;
     int sd = ds4_tensor_device_idx(src);
     int dd = ds4_tensor_device_idx(dst);
+
+    int amb = -1; (void)cudaGetDevice(&amb);
+    if (ds4_ssd_debug_on()) {
+        fprintf(stderr,
+                "ds4[probe] copy_xdev sd=%d dd=%d bytes=%llu ambient_dev=%d dst_bytes=%llu src_bytes=%llu\n",
+                sd, dd, (unsigned long long)bytes, amb,
+                (unsigned long long)dst->bytes, (unsigned long long)src->bytes);
+        fflush(stderr);
+    }
 
     /* Same-device fast path. */
     if (sd == dd) {
@@ -8908,11 +8955,18 @@ extern "C" int ds4_gpu_embed_token_hc_tensor(ds4_gpu_tensor *out_hc, const void 
     uint64_t weight_bytes = (uint64_t)n_vocab * n_embd * sizeof(uint16_t);
     if (weight_offset > model_size || weight_bytes > model_size - weight_offset) return 0;
     const int logical_tier = ds4_tensor_device_idx(out_hc);
-    const char *wptr = cuda_resolve_weight_ptr(model_map, weight_offset, weight_bytes, logical_tier, "token_embd");
-    if (!wptr) return 0;
-    uint32_t n = n_embd * n_hc;
-    embed_token_hc_kernel<<<(n + 255) / 256, 256>>>((float *)out_hc->ptr, (const unsigned short *)wptr, token, n_embd, n_hc);
-    return cuda_ok(cudaGetLastError(), "embed token launch");
+    int target_dev = (logical_tier >= 0 && logical_tier < g_n_gpus) ? g_gpu[logical_tier].device_id : 0;
+    int ok = 0;
+    WITH_DEVICE(target_dev) {
+        const char *wptr = cuda_resolve_weight_ptr(model_map, weight_offset, weight_bytes, logical_tier, "token_embd");
+        if (!wptr) { ok = 0; }
+        else {
+            uint32_t n = n_embd * n_hc;
+            embed_token_hc_kernel<<<(n + 255) / 256, 256>>>((float *)out_hc->ptr, (const unsigned short *)wptr, token, n_embd, n_hc);
+            ok = cuda_ok(cudaGetLastError(), "embed token launch");
+        }
+    }
+    return ok;
 }
 
 extern "C" int ds4_gpu_embed_tokens_hc_tensor(
@@ -8933,18 +8987,40 @@ extern "C" int ds4_gpu_embed_tokens_hc_tensor(
         return 0;
     }
     const int logical_tier = ds4_tensor_device_idx(out_hc);
-    const char *wptr = cuda_resolve_weight_ptr(model_map, weight_offset,
-                                                (uint64_t)n_vocab * n_embd * sizeof(uint16_t),
-                                                logical_tier,
-                                                "token_embd");
-    if (!wptr) return 0;
-    uint64_t n = (uint64_t)n_tokens * n_hc * n_embd;
-    embed_tokens_hc_kernel<<<(n + 255) / 256, 256>>>(
-        (float *)out_hc->ptr,
-        (const int32_t *)tokens_t->ptr,
-        (const __half *)wptr,
-        n_vocab, n_tokens, n_embd, n_hc);
-    return cuda_ok(cudaGetLastError(), "embed tokens launch");
+    int tokens_tier = ds4_tensor_device_idx(tokens_t);
+    int ambient_dev = -1; (void)cudaGetDevice(&ambient_dev);
+    int target_dev = (logical_tier >= 0 && logical_tier < g_n_gpus) ? g_gpu[logical_tier].device_id : -99;
+    if (ds4_ssd_debug_on()) {
+        fprintf(stderr,
+                "ds4[probe] embed_tokens_hc ENTER n_tokens=%u out_tier=%d(dev%d) "
+                "tokens_tier=%d ambient_dev=%d%s\n",
+                n_tokens, logical_tier, target_dev, tokens_tier, ambient_dev,
+                (ambient_dev != target_dev) ? " <<<DEVICE MISMATCH>>>" : "");
+        fflush(stderr);
+    }
+    /* Pin the kernel to out_hc's home device: cuda_resolve_weight_ptr returns
+     * a device-local pointer valid only on logical_tier's physical device, and
+     * out_hc/tokens_t live there too. Without this the kernel launched on the
+     * ambient device (left there by a prior decode on another tier) and the
+     * first prefill chunk took an illegal memory access. */
+    int ok = 0;
+    WITH_DEVICE(target_dev) {
+        const char *wptr = cuda_resolve_weight_ptr(model_map, weight_offset,
+                                                    (uint64_t)n_vocab * n_embd * sizeof(uint16_t),
+                                                    logical_tier,
+                                                    "token_embd");
+        if (!wptr) { ok = 0; }
+        else {
+            uint64_t n = (uint64_t)n_tokens * n_hc * n_embd;
+            embed_tokens_hc_kernel<<<(n + 255) / 256, 256>>>(
+                (float *)out_hc->ptr,
+                (const int32_t *)tokens_t->ptr,
+                (const __half *)wptr,
+                n_vocab, n_tokens, n_embd, n_hc);
+            ok = cuda_ok(cudaGetLastError(), "embed tokens launch");
+        }
+    }
+    return ok;
 }
 
 static int indexer_scores_launch(
