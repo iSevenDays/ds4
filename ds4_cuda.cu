@@ -1219,9 +1219,42 @@ static float *cuda_q8_f32_ptr(
     return dev;
 }
 
+/* CUDA "sticky" errors permanently invalidate the context: after one of them
+ * every subsequent CUDA call returns cudaErrorIllegalAddress, so the engine
+ * would keep surfacing HTTP 500 ("cuda prefill state reset failed") on every
+ * request until manually restarted. Fail fast on these so the supervisor
+ * (systemd Restart=on-failure) restarts the process and restores service.
+ * Override for debugging with DS4_CUDA_NO_FAIL_FAST=1. */
+static bool cuda_err_is_sticky(cudaError_t err) {
+    switch (err) {
+        case cudaErrorIllegalAddress:        /* "an illegal memory access was encountered" */
+        case cudaErrorLaunchFailure:
+        case cudaErrorHardwareStackError:
+        case cudaErrorIllegalInstruction:
+        case cudaErrorInvalidPc:
+        case cudaErrorMisalignedAddress:
+        case cudaErrorAssert:
+        case cudaErrorCooperativeLaunchTooLarge:
+            return true;
+        default:
+            return false;
+    }
+}
+
 static int cuda_ok(cudaError_t err, const char *what) {
     if (err == cudaSuccess) return 1;
     fprintf(stderr, "ds4: CUDA %s failed: %s\n", what, cudaGetErrorString(err));
+    if (cuda_err_is_sticky(err) && getenv("DS4_CUDA_NO_FAIL_FAST") == NULL) {
+        fprintf(stderr,
+                "ds4: CUDA %s failed: %s is a sticky unrecoverable context error; "
+                "exiting so the supervisor can restart the process "
+                "(set DS4_CUDA_NO_FAIL_FAST=1 to disable).\n",
+                what, cudaGetErrorString(err));
+        fflush(stderr);
+        /* _exit, not exit: skip atexit handlers that could themselves touch
+         * the broken CUDA context and hang. The OS reclaims all resources. */
+        _exit(1);
+    }
     return 0;
 }
 
