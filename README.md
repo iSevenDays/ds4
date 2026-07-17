@@ -67,6 +67,97 @@ sessions, and open issues including the full trace.
 
 The `ds4-agent` is alpha quality, the project was later added.
 
+## Quick Start
+
+### 1. Download a model
+
+```sh
+./download_model.sh q2-imatrix    # 2-bit, recommended for 48-96 GB GPUs
+```
+
+This fetches the imatrix-tuned DeepSeek V4 Flash GGUF into `./gguf/` and
+symlinks it as `./ds4flash.gguf`.
+
+### 2. Build
+
+```sh
+# macOS (Metal)
+make
+
+# Linux CUDA — specify your GPU architecture
+make cuda CUDA_ARCH=sm_89      # RTX 4090
+make cuda CUDA_ARCH=sm_120     # DGX Spark / GB10
+make cuda CUDA_ARCH=native     # auto-detect local GPU
+```
+
+### 3. Run — single GPU (SSD streaming)
+
+The model is larger than a single GPU's VRAM, so SSD streaming keeps
+non-routed weights resident and pages routed experts from the GGUF on
+demand:
+
+```sh
+./ds4-server \
+  --cuda --ssd-streaming --ssd-streaming-cache-experts 16GB \
+  --ctx 131072 \
+  -m ./ds4flash.gguf \
+  --host 0.0.0.0 --port 8000
+```
+
+Test it:
+
+```sh
+curl -s http://localhost:8000/v1/chat/completions \
+  -H 'Content-Type: application/json' \
+  -d '{"messages":[{"role":"user","content":"What is 8+8? Just the number."}],"max_tokens":48}' \
+  | python3 -m json.tool
+```
+
+### 4. Run — multi-GPU (2+ GPUs, layer-parallel + per-tier SSD streaming)
+
+Split layers across GPUs with `--gpu-vram`. Each GPU gets its own SSD
+expert cache and streams only its own layers' experts:
+
+```sh
+./ds4-server \
+  --cuda --ssd-streaming --ssd-streaming-cache-experts 16GB \
+  --gpu-vram 45,45 \
+  --ctx 131072 \
+  -m ./ds4flash.gguf \
+  --host 0.0.0.0 --port 8000
+```
+
+Startup prints the layout, for example:
+
+```
+multi-GPU layout:
+  GPU0: layers 0-20 + embedding  (5.2 / 45.0 GB)
+  GPU1: layers 21-42 + output head  (5.0 / 45.0 GB)
+```
+
+Use `--gpu-vram auto` to auto-detect per-GPU budgets, or
+`--gpu-devices 0,1` to bind specific device indices.
+
+### 5. Interactive CLI / agent
+
+```sh
+./ds4 -m ./ds4flash.gguf --ssd-streaming --ssd-streaming-cache-experts 16GB
+./ds4-agent -m ./ds4flash.gguf --ssd-streaming --ssd-streaming-cache-experts 16GB
+```
+
+Wire `--gpu-vram 45,45` into any of the `ds4*` binaries to use multi-GPU.
+
+### Key flags
+
+| Flag | Purpose |
+| --- | --- |
+| `--ssd-streaming` | Enable SSD-backed weight streaming (model > VRAM). |
+| `--ssd-streaming-cache-experts NNG` | Routed-expert cache budget per tier (e.g. `16GB`). |
+| `--gpu-vram N1,N2,...` | Per-GPU VRAM budget in GiB; enables multi-GPU. |
+| `--gpu-devices D1,D2,...` | Explicit CUDA device indices. |
+| `--ctx N` | Context window size in tokens. |
+| `--nothink` / `--think` | Toggle DeepSeek thinking mode. |
+
 ## More Documentation
 
 If you are looking for very specific things, we have other
