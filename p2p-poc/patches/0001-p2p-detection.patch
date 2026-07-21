@@ -1,0 +1,72 @@
+# 0001-p2p-detection.patch — NO-OP (already implemented in tree)
+
+The P2P detection this patch was meant to add is **already in the
+codebase** at `ds4_cuda.cu:2326-2400`. The existing implementation is
+strictly better than the original sketch in this patch because it
+also validates that peer copies actually deliver correct data at
+realistic sizes (multi-size, multi-iteration round-trip). This
+validation matters: on RTX 6000 Ada under recent drivers,
+`cudaDeviceCanAccessPeer` and `cudaDeviceEnablePeerAccess` both
+report success while `cudaMemcpyPeer` silently corrupts data. The
+existing probe catches that and falls back to BOUNCE.
+
+## What the existing code does
+
+Pseudocode of the existing probe (paraphrased from ds4_cuda.cu:2326-2400):
+
+```c
+for each (i, j) pair where i != j:
+    cudaDeviceCanAccessPeer(&can, device_id[i], device_id[j])
+    if !can: g_gpu_peer_ok[i][j] = 0; continue
+
+    cudaSetDevice(device_id[i])
+    err = cudaDeviceEnablePeerAccess(device_id[j], 0)
+    if err != cudaSuccess && err != cudaErrorPeerAccessAlreadyEnabled:
+        g_gpu_peer_ok[i][j] = 0; continue
+
+    // Validation: write distinct known patterns, peer-copy to dst,
+    // read back, byte-compare. Multiple sizes (4 KB, 256 KB, 1 MB, 16 MB)
+    // and multiple iterations — ALL must round-trip byte-perfect.
+    for size in [4 KB, 256 KB, 1 MB, 16 MB]:
+        for iter in [0..3):
+            fill src_dev with pattern(size, iter, i, j)
+            cudaMemcpyPeer(dst_dev, j, src_dev, i, size)
+            cudaMemcpy(host_buf, dst_dev, size, D2H)
+            if memcmp(host_buf, expected_pattern) != 0:
+                g_gpu_peer_ok[i][j] = 0; goto next_pair
+
+    g_gpu_peer_ok[i][j] = 1
+next_pair:
+```
+
+## What this means for the PoC
+
+- On **RTX 4090 D** (current hardware): `cudaDeviceCanAccessPeer` returns
+  0, the matrix is all-zero, patches 0002/0003/0004 are inert.
+- On **pro cards (A100, H100, RTX 6000 Ada)**: P2P is enabled *only if*
+  the validation passes. RTX 6000 Ada may fail validation on affected
+  driver versions — retest after driver updates.
+- The L2 cache code in patches 0002-0004 reads `g_gpu_peer_ok[][]`
+  directly, so it picks up the validated flag automatically. No
+  changes needed here.
+
+## Why this patch is preserved as a doc
+
+Future contributors reading the PoC folder will expect a 0001 patch.
+Keeping it as a no-op-with-explanation avoids confusion and points
+them at the real implementation.
+
+## If you ever need to extend the probe
+
+Things you might want to add to the existing probe (none are needed
+for the L2 cache to work, but they would harden the validation):
+
+1. Larger validation sizes (the current max is 16 MB; the L2 slab
+   will move ~7 MB per expert, so 16 MB is already representative).
+2. Stress-test under concurrent SSD DMA (the current probe runs
+   standalone). Could matter if the SSD's host-pinned DMA interacts
+   with the peer copy's traversal of the same PCIe root complex.
+3. Driver-version logging (capture `nvidia-smi --query-gpu=driver_version`
+   alongside the probe result so future regressions are traceable).
+
+These would go in the existing function, not in this patch.

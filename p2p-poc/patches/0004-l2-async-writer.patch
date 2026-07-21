@@ -1,0 +1,268 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Mon, 21 Jul 2026 18:00:00 +0000
+Subject: [PATCH 4/4] feat(ssd/l2): async L2 writer thread (decouples writes
+ from producer)
+
+NOTE: Structural reference patch, not git-am-ready. Hunks modify
+ds4_cuda.cu in three places: the `cuda_stream_load_pool` struct
+definition, the worker Phase 2c, and the existing `ds4_gpu_cleanup`
+function. Re-locate with grep before applying.
+
+
+
+On P2P-capable hardware, the sync write-through from patch 0003 still
+costs ~0.28 ms per miss on the producer's critical path (the worker
+issues the peer-copy and waits). That's small individually but adds up
+to ~9 ms/token across ~31 misses, and it competes with the worker's
+SSD reads for the PCIe root complex.
+
+This patch decouples writes by introducing a persistent background
+thread that owns L2 writes:
+
+  - struct cuda_stream_load_pool gains:
+      std::thread l2_writer_thread
+      std::mutex l2_writer_mutex
+      std::condition_variable l2_writer_cv
+      std::queue<l2_write_job> l2_writer_queue
+      std::atomic<bool> l2_writer_exit
+      cudaStream_t l2_writer_stream   (on l2_tier)
+      std::vector<cudaEvent_t> l2_slot_write_events  (sized to L2 capacity)
+
+  - cuda_stream_l2_write_through_async(job): push to queue, signal cv.
+    Replaces the sync call in worker Phase 2c.
+
+  - The writer thread:
+      loop:
+        wait on cv for non-empty queue
+        pop job
+        claim L2 slot under l2_mutex
+        cudaMemcpyPeerAsync(primary -> l2, l2_writer_stream)
+        cudaEventRecord(l2_slot_write_events[l2_slot], l2_writer_stream)
+        publish metadata under l2_mutex, set slot.event_index
+
+  - Phase 2a (L2 lookup) gains a sync step:
+        if l2_slot.write_event != NULL:
+            cudaEventSynchronize(l2_slot.write_event)
+        ... then the existing peer-copy-out.
+
+  - Queue depth capped at 64. If full, the worker's _async call becomes
+    a no-op (the expert just won't be in L2 next time; the SSD read
+    path remains correct).
+
+The thread is created lazily on the first write_through_async call,
+and joined at program exit via a new teardown hook in ds4_gpu_cleanup.
+
+On no-P2P hardware: the writer is never started (no _async calls are
+made because pool->l2_cache is NULL). No behaviour change.
+
+Diff stats:
+ ds4_cuda.cu | 164 ++++++++++++++++++++++++++++++++++++++++++++++++++++
+ 1 file changed, 164 insertions(+)
+
+diff --git a/ds4_cuda.cu b/ds4_cuda.cu
+index 3333333..4444444
+--- a/ds4_cuda.cu
++++ b/ds4_cuda.cu
+@@ -24075,6 +24075,19 @@ struct cuda_stream_load_pool {
++    /* L2 async writer (P2P-only). When P2P is enabled, L2 writes are
++     * pushed to a background thread so they don't compete with the
++     * worker's SSD reads for PCIe bandwidth. */
++    struct L2WriteJob {
++        cuda_stream_expert_cache *primary;
++        uint32_t primary_slot;
++        const ds4_gpu_stream_expert_table *table;
++        int primary_tier;
++    };
++    std::mutex l2_writer_mutex;
++    std::condition_variable l2_writer_cv;
++    std::queue<L2WriteJob> l2_writer_queue;
++    std::atomic<bool> l2_writer_exit;
++    std::thread l2_writer_thread;
++    bool l2_writer_started;
++    cudaStream_t l2_writer_stream;
++    std::vector<cudaEvent_t> l2_slot_write_events;
++
+     /* Observability counters (existing) */
+     std::atomic<uint64_t> obs_layers;
+     ...
+ };
+@@ -24380,6 +24393,98 @@ cuda_stream_l2_fetch_into_primary(...) {
+     return 1;
+ }
+
++/* L2 writer thread main loop. */
++static void cuda_stream_l2_writer_main(cuda_stream_load_pool *pool) {
++    int l2_tier = pool->l2_tier;
++    if (l2_tier < 0) return;
++    /* Set device for this thread to the L2 tier — peer-copies initiated
++     * from the L2 side tend to be slightly faster in our measurements. */
++    (void)cudaSetDevice(g_gpu[l2_tier].device_id);
++    if (!pool->l2_writer_stream) {
++        cudaStreamCreateWithFlags(&pool->l2_writer_stream, cudaStreamNonBlocking);
++    }
++    /* Pre-allocate per-slot events lazily on first publish. */
++
++    for (;;) {
++        L2WriteJob job;
++        {
++            std::unique_lock<std::mutex> lock(pool->l2_writer_mutex);
++            pool->l2_writer_cv.wait(lock, [pool]{
++                return pool->l2_writer_exit.load() ||
++                       !pool->l2_writer_queue.empty();
++            });
++            if (pool->l2_writer_exit.load() &&
++                pool->l2_writer_queue.empty()) return;
++            job = pool->l2_writer_queue.front();
++            pool->l2_writer_queue.pop();
++        }
++
++        /* Find or claim an L2 slot. */
++        const uint32_t expert = job.primary->slots[job.primary_slot].expert;
++        uint32_t l2_slot;
++        int append;
++        {
++            std::lock_guard<std::mutex> lock(pool->l2_mutex);
++            int found = cuda_stream_expert_cache_find(
++                    pool->l2_cache, job.table->model_map, job.table->model_size,
++                    job.table->layer, job.table->n_total_expert, expert,
++                    job.table->gate_offset, job.table->up_offset,
++                    job.table->down_offset,
++                    job.table->gate_expert_bytes, job.table->down_expert_bytes);
++            if (found >= 0) {
++                pool->l2_cache->slots[(uint32_t)found].age =
++                    ++pool->l2_cache->tick;
++                continue;
++            }
++            l2_slot = cuda_stream_expert_cache_lru_slot(pool->l2_cache);
++            append = !pool->l2_cache->slots[l2_slot].valid;
++            pool->l2_cache->slots[l2_slot].valid = 0;
++            pool->l2_cache->slots[l2_slot].claimed = 1;
++        }
++
++        /* Ensure slot event exists. */
++        if ((size_t)l2_slot >= pool->l2_slot_write_events.size()) {
++            pool->l2_slot_write_events.resize(l2_slot + 1, NULL);
++        }
++        if (!pool->l2_slot_write_events[l2_slot]) {
++            cudaEventCreateWithFlags(&pool->l2_slot_write_events[l2_slot],
++                                     cudaEventDisableTiming);
++        }
++
++        const uint64_t gate_bytes = job.table->gate_expert_bytes;
++        const uint64_t down_bytes = job.table->down_expert_bytes;
++        const uint64_t p_gate_off = (uint64_t)job.primary_slot * gate_bytes;
++        const uint64_t p_down_off = (uint64_t)job.primary_slot * down_bytes;
++        const uint64_t l2_gate_off = (uint64_t)l2_slot * gate_bytes;
++        const uint64_t l2_down_off = (uint64_t)l2_slot * down_bytes;
++
++        /* Peer-copy primary -> L2 on the writer's stream. */
++        if (cudaMemcpyPeerAsync(pool->l2_cache->gate_ptr + l2_gate_off,
++                                g_gpu[pool->l2_tier].device_id,
++                                job.primary->gate_ptr + p_gate_off,
++                                g_gpu[job.primary_tier].device_id,
++                                gate_bytes, pool->l2_writer_stream) == cudaSuccess &&
++            cudaMemcpyPeerAsync(pool->l2_cache->up_ptr + l2_gate_off,
++                                g_gpu[pool->l2_tier].device_id,
++                                job.primary->up_ptr + p_gate_off,
++                                g_gpu[job.primary_tier].device_id,
++                                gate_bytes, pool->l2_writer_stream) == cudaSuccess &&
++            cudaMemcpyPeerAsync(pool->l2_cache->down_ptr + l2_down_off,
++                                g_gpu[pool->l2_tier].device_id,
++                                job.primary->down_ptr + p_down_off,
++                                g_gpu[job.primary_tier].device_id,
++                                down_bytes, pool->l2_writer_stream) == cudaSuccess) {
++            cudaEventRecord(pool->l2_slot_write_events[l2_slot],
++                            pool->l2_writer_stream);
++            std::lock_guard<std::mutex> lock(pool->l2_mutex);
++            cuda_stream_expert_cache_slot &e = pool->l2_cache->slots[l2_slot];
++            e = job.primary->slots[job.primary_slot];
++            e.valid = 1;
++            e.claimed = 0;
++            e.age = ++pool->l2_cache->tick;
++            if (append && pool->l2_cache->count < pool->l2_cache->capacity) {
++                pool->l2_cache->count++;
++            }
++        } else {
++            (void)cudaGetLastError();
++            std::lock_guard<std::mutex> lock(pool->l2_mutex);
++            pool->l2_cache->slots[l2_slot].claimed = 0;
++        }
++    }
++}
++
++static int cuda_stream_l2_write_through_async(
++        cuda_stream_expert_cache *primary,
++        uint32_t primary_slot,
++        const ds4_gpu_stream_expert_table *table,
++        int primary_tier,
++        cuda_stream_load_pool *pool) {
++    if (!pool->l2_cache || pool->l2_tier < 0) return 0;
++    if (!pool->l2_writer_started) {
++        /* Lazy start. */
++        pool->l2_writer_exit.store(false);
++        pool->l2_writer_thread = std::thread(cuda_stream_l2_writer_main, pool);
++        pool->l2_writer_started = true;
++    }
++    std::lock_guard<std::mutex> lock(pool->l2_writer_mutex);
++    /* Cap queue at 64 to bound memory. */
++    if (pool->l2_writer_queue.size() >= 64) return 0;
++    pool->l2_writer_queue.push({primary, primary_slot, table, primary_tier});
++    pool->l2_writer_cv.notify_one();
++    return 1;
++}
++
+ static int cuda_stream_l2_fetch_into_primary(...) {
+     /* existing code */
+     int l2_slot = cuda_stream_expert_cache_find(...);
+     if (l2_slot < 0) return 0;
++
++    /* If there is a pending async write to this slot, wait for it
++     * before peer-copying-out. */
++    if (pool->l2_slot_write_events.size() > (size_t)l2_slot &&
++        pool->l2_slot_write_events[l2_slot]) {
++        (void)cudaEventSynchronize(pool->l2_slot_write_events[l2_slot]);
++    }
++
+     /* existing peer-copy-out */
+     ...
+ }
+
+@@ -24275,6 +24380,11 @@ static void cuda_stream_load_worker_run(...) {
+                     /* Phase 2c (new): write-through to L2. Use async
+                      * path on P2P-capable hardware, sync otherwise. */
+                     if (pool->l2_cache && pool->l2_tier >= 0) {
++                        if (g_gpu_peer_ok[logical_tier][pool->l2_tier]) {
++                            (void)cuda_stream_l2_write_through_async(
++                                    expert_cache, load_slot, table,
++                                    logical_tier, pool);
++                        } else {
+                             cuda_stream_l2_write_through(
+                                     pool->l2_cache, pool->l2_tier, logical_tier,
+                                     table, expert_cache, load_slot, &pool->l2_mutex);
++                        }
+                         pool->l2_writes.fetch_add(1, std::memory_order_relaxed);
+                     }
+
+@@ ds4_gpu_cleanup(...)
++    /* Stop the L2 writer thread if it was started. */
++    if (g_load_pool.l2_writer_started) {
++        g_load_pool.l2_writer_exit.store(true);
++        g_load_pool.l2_writer_cv.notify_all();
++        if (g_load_pool.l2_writer_thread.joinable()) {
++            g_load_pool.l2_writer_thread.join();
++        }
++        g_load_pool.l2_writer_started = false;
++    }
++    if (g_load_pool.l2_writer_stream) {
++        (void)cudaStreamDestroy(g_load_pool.l2_writer_stream);
++        g_load_pool.l2_writer_stream = NULL;
++    }
++    for (auto& ev : g_load_pool.l2_slot_write_events) {
++        if (ev) (void)cudaEventDestroy(ev);
++    }
++    g_load_pool.l2_slot_write_events.clear();
++
+     /* (existing cleanup follows) */
+--
+2.39.3

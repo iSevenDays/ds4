@@ -1,0 +1,306 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Mon, 21 Jul 2026 18:00:00 +0000
+Subject: [PATCH 2/4] feat(ssd/l2): add L2 expert cache scaffolding (inert
+ without P2P)
+
+NOTE: This is a structural reference patch, not a git-am-ready file.
+The hunk headers and line numbers are approximate. The functions
+listed here are meant to be inserted into ds4_cuda.cu right after the
+existing cuda_stream_expert_cache_release_all (around line 23280 in
+the committed state at 85512d5) and before the parallel pool code
+that starts around line 23825. Re-validate the insertion points with
+`grep -n` before applying.
+
+
+
+Adds the data structures and primitive helpers for an L2 expert cache
+on a peer tier (GPU1 in TP+SSD mode). All entry points are gated on
+g_gpu_peer_ok[primary_tier][l2_tier] && g_gpu_peer_ok[l2_tier][primary_tier]
+so the entire feature is silently inactive on GeForce / no-P2P
+hardware.
+
+Adds:
+  - struct cuda_stream_load_pool gains l2_cache, l2_tier, l2_mutex,
+    l2_hits / l2_misses / l2_writes counters.
+  - cuda_stream_l2_tier_for(primary): returns the lowest tier != primary
+    if P2P is two-way enabled; -1 otherwise.
+  - cuda_stream_l2_ensure(primary, gate_bytes, down_bytes): lazily
+    allocate the L2 cache on the L2 tier via the existing
+    cuda_stream_expert_cache_prepare.
+  - cuda_stream_l2_fetch_into_primary(): lookup + peer-copy L2 -> claimed
+    primary slot, publish primary slot metadata.
+  - cuda_stream_l2_write_through(): peer-copy primary slot -> L2 slot,
+    with claim-flag serialisation.
+  - cuda_xdev_copy_raw(): raw-pointer peer copy wrapper that uses
+    cudaMemcpyPeer when P2P is available, transparent BOUNCE otherwise.
+  - cuda_stream_expert_cache_release_all_at(): release helper that
+    takes an explicit cache pointer (the existing release_all operates
+    on ssd_current()).
+
+The L2 helpers are not yet called from anywhere — that's patch 0003.
+
+Diff stats:
+ ds4_cuda.cu | 285 ++++++++++++++++++++++++++++++++++++++++++++++++++++
+ 1 file changed, 285 insertions(+)
+
+diff --git a/ds4_cuda.cu b/ds4_cuda.cu
+index 1111111..2222222
+--- a/ds4_cuda.cu
++++ b/ds4_cuda.cu
+@@ -23280,6 +23280,20 @@ static void cuda_stream_expert_cache_release_all(void) {
+     memset(&ssd->expert_cache, 0, sizeof(ssd->expert_cache));
+ }
+
++/* Release a specific expert cache (not necessarily ssd_current()'s). Caller
++ * must be on the device that owns the cache. */
++static void cuda_stream_expert_cache_release_all_at(cuda_stream_expert_cache *ec) {
++    if (!ec) return;
++    if (ec->gate_ptr) (void)cudaFree(ec->gate_ptr);
++    if (ec->up_ptr)   (void)cudaFree(ec->up_ptr);
++    if (ec->down_ptr) (void)cudaFree(ec->down_ptr);
++    ec->slots.clear();
++    memset(ec, 0, sizeof(*ec));
++}
++
+ /* === L2 expert cache helpers ==============================================
+  *
+  * The L2 lives on a peer tier (e.g. GPU1 in TP+SSD mode, where GPU1's
+  * VRAM is otherwise idle during decode). It holds experts that have been
+  * evicted from GPU0's primary LRU, giving a 2-level hierarchy:
+  *   GPU0 (fast D2D) -> GPU1 (peer copy, P2P only) -> SSD.
+  *
+  * Every entry point is gated on g_gpu_peer_ok[primary][l2] AND
+  * g_gpu_peer_ok[l2][primary]. On no-P2P hardware (RTX 4090 D, GeForce
+  * driver) both bits are 0 and the L2 is silently disabled.
+  *
+  * Outside the gate, the cross-tier copy is cudaMemcpyPeer; on P2P-
+  * enabled hardware that's ~24 GB/s, on BOUNCE-fallback hardware
+  * it's ~3 GB/s (do not engage the L2 there — see
+  * p2p-poc/analysis/BOUNCE_BOTTLENECK.md).
+  */
++
++/* Cross-tier copy between two raw device pointers. Uses cudaMemcpyPeer
++ * (which auto-dispatches to P2P when enabled by cudaDeviceEnablePeerAccess
++ * and to internal BOUNCE otherwise). Synchronous. */
++static int cuda_xdev_copy_raw(char *dst, int dst_dev,
++                              const char *src, int src_dev,
++                              uint64_t bytes) {
++    if (bytes == 0) return 1;
++    if (!dst || !src) return 0;
++    int prev = -1;
++    (void)cudaGetDevice(&prev);
++    if (cudaSetDevice(src_dev) != cudaSuccess) {
++        if (prev >= 0) (void)cudaSetDevice(prev);
++        return 0;
++    }
++    cudaError_t err = cudaMemcpyPeer(dst, dst_dev, src, src_dev, (size_t)bytes);
++    if (err != cudaSuccess) {
++        (void)cudaGetLastError();
++        if (prev >= 0) (void)cudaSetDevice(prev);
++        return 0;
++    }
++    if (prev >= 0) (void)cudaSetDevice(prev);
++    return 1;
++}
++
++/* Pick the L2 tier for a given primary tier. Returns -1 if L2 is
++ * disabled (env override, single-GPU, or P2P not two-way enabled). */
++static int cuda_stream_l2_tier_for(int primary_tier) {
++    if (g_n_gpus < 2) return -1;
++    if (primary_tier < 0 || primary_tier >= g_n_gpus) return -1;
++    if (getenv("DS4_CUDA_STREAMING_NO_L2") != NULL) return -1;
++    /* Require two-way P2P so both reads and writes are fast. */
++    int two_way_p2p = 0;
++    for (int t = 0; t < g_n_gpus; t++) {
++        if (t == primary_tier) continue;
++        if (g_gpu_peer_ok[primary_tier][t] && g_gpu_peer_ok[t][primary_tier]) {
++            two_way_p2p = 1;
++            break;
++        }
++    }
++    if (!two_way_p2p) return -1;
++    /* Use the lowest non-primary tier as the L2. */
++    for (int t = 0; t < g_n_gpus; t++) {
++        if (t != primary_tier) return t;
++    }
++    return -1;
++}
++
++/* Lazily allocate the L2 cache on the L2 tier. Returns the prepared L2
++ * cache or NULL. Idempotent: reuses the existing cache if dimensions
++ * match. */
++static cuda_stream_expert_cache *cuda_stream_l2_ensure(
++        int primary_tier,
++        uint64_t gate_expert_bytes,
++        uint64_t down_expert_bytes) {
++    int l2_tier = cuda_stream_l2_tier_for(primary_tier);
++    if (l2_tier < 0) return NULL;
++
++    if (g_load_pool.l2_tier != l2_tier) {
++        /* L2 tier changed (e.g. topology change). Release any existing L2. */
++        if (g_load_pool.l2_cache && g_load_pool.l2_cache->valid) {
++            int prev = -1;
++            (void)cudaGetDevice(&prev);
++            (void)cudaSetDevice(g_gpu[g_load_pool.l2_tier].device_id);
++            cuda_stream_expert_cache_release_all_at(g_load_pool.l2_cache);
++            if (prev >= 0) (void)cudaSetDevice(prev);
++        }
++        g_load_pool.l2_cache = NULL;
++        g_load_pool.l2_tier = l2_tier;
++    }
++
++    if (g_load_pool.l2_cache && g_load_pool.l2_cache->valid &&
++        g_load_pool.l2_cache->gate_expert_bytes == gate_expert_bytes &&
++        g_load_pool.l2_cache->down_expert_bytes == down_expert_bytes) {
++        return g_load_pool.l2_cache;
++    }
++
++    int prev = -1;
++    (void)cudaGetDevice(&prev);
++    if (cudaSetDevice(g_gpu[l2_tier].device_id) != cudaSuccess) {
++        if (prev >= 0) (void)cudaSetDevice(prev);
++        return NULL;
++    }
++    const uint32_t cfg_budget = cuda_stream_expert_cache_configured_budget();
++    cuda_stream_expert_cache *l2 = cuda_stream_expert_cache_prepare(
++            gate_expert_bytes, down_expert_bytes, cfg_budget);
++    if (prev >= 0) (void)cudaSetDevice(prev);
++    if (!l2) {
++        if (getenv("DS4_CUDA_STREAMING_LOAD_DEBUG")) {
++            fprintf(stderr, "ds4[load-pool] L2 cache alloc failed on tier %d\n", l2_tier);
++        }
++        g_load_pool.l2_tier = -1;
++        return NULL;
++    }
++    g_load_pool.l2_cache = l2;
++    if (getenv("DS4_CUDA_STREAMING_LOAD_DEBUG")) {
++        fprintf(stderr,
++                "ds4[load-pool] L2 cache ready on tier %d capacity=%u experts (p2p=1)\n",
++                l2_tier, l2->capacity);
++    }
++    return l2;
++}
++
++/* Try to serve an expert from the L2. On hit, peer-copy L2 -> claimed
++ * primary slot, publish primary metadata, return 1. On miss, return 0.
++ * Caller must hold pool->lru_mutex (Phase 1 already claimed the slot). */
++static int cuda_stream_l2_fetch_into_primary(
++        cuda_stream_expert_cache *l2,
++        int l2_tier,
++        int primary_tier,
++        cuda_stream_expert_cache *primary,
++        uint32_t primary_slot,
++        const ds4_gpu_stream_expert_table *table,
++        uint32_t expert) {
++    if (!l2 || !l2->valid) return 0;
++    int l2_slot = cuda_stream_expert_cache_find(
++            l2, table->model_map, table->model_size,
++            table->layer, table->n_total_expert, expert,
++            table->gate_offset, table->up_offset, table->down_offset,
++            table->gate_expert_bytes, table->down_expert_bytes);
++    if (l2_slot < 0) return 0;
++
++    const uint64_t gate_bytes = table->gate_expert_bytes;
++    const uint64_t down_bytes = table->down_expert_bytes;
++    const uint64_t l2_gate_off = (uint64_t)l2_slot * gate_bytes;
++    const uint64_t l2_down_off = (uint64_t)l2_slot * down_bytes;
++    const uint64_t p_gate_off = (uint64_t)primary_slot * gate_bytes;
++    const uint64_t p_down_off = (uint64_t)primary_slot * down_bytes;
++
++    if (!cuda_xdev_copy_raw(primary->gate_ptr + p_gate_off,
++                            g_gpu[primary_tier].device_id,
++                            l2->gate_ptr + l2_gate_off,
++                            g_gpu[l2_tier].device_id, gate_bytes) ||
++        !cuda_xdev_copy_raw(primary->up_ptr + p_gate_off,
++                            g_gpu[primary_tier].device_id,
++                            l2->up_ptr + l2_gate_off,
++                            g_gpu[l2_tier].device_id, gate_bytes) ||
++        !cuda_xdev_copy_raw(primary->down_ptr + p_down_off,
++                            g_gpu[primary_tier].device_id,
++                            l2->down_ptr + l2_down_off,
++                            g_gpu[l2_tier].device_id, down_bytes)) {
++        return 0;
++    }
++    l2->slots[(uint32_t)l2_slot].age = ++l2->tick;
++
++    cuda_stream_expert_cache_slot &entry = primary->slots[primary_slot];
++    entry.valid = 1;
++    entry.model_map = table->model_map;
++    entry.model_size = table->model_size;
++    entry.layer = table->layer;
++    entry.n_total_expert = table->n_total_expert;
++    entry.expert = expert;
++    entry.gate_offset = table->gate_offset;
++    entry.up_offset = table->up_offset;
++    entry.down_offset = table->down_offset;
++    entry.gate_expert_bytes = table->gate_expert_bytes;
++    entry.down_expert_bytes = table->down_expert_bytes;
++    entry.age = ++primary->tick;
++    return 1;
++}
++
++/* Write-through: peer-copy primary slot -> L2 slot. Skips if expert is
++ * already in L2. Best-effort. Uses claim-flag serialisation. */
++static void cuda_stream_l2_write_through(
++        cuda_stream_expert_cache *l2,
++        int l2_tier,
++        int primary_tier,
++        const ds4_gpu_stream_expert_table *table,
++        cuda_stream_expert_cache *primary,
++        uint32_t primary_slot,
++        std::mutex *l2_mutex) {
++    if (!l2 || !l2->valid) return;
++    const uint32_t expert = primary->slots[primary_slot].expert;
++    uint32_t l2_slot;
++    int append;
++    {
++        std::lock_guard<std::mutex> lock(*l2_mutex);
++        int found = cuda_stream_expert_cache_find(
++                l2, table->model_map, table->model_size,
++                table->layer, table->n_total_expert, expert,
++                table->gate_offset, table->up_offset, table->down_offset,
++                table->gate_expert_bytes, table->down_expert_bytes);
++        if (found >= 0) {
++            l2->slots[(uint32_t)found].age = ++l2->tick;
++            return;
++        }
++        l2_slot = cuda_stream_expert_cache_lru_slot(l2);
++        append = !l2->slots[l2_slot].valid;
++        l2->slots[l2_slot].valid = 0;
++        l2->slots[l2_slot].claimed = 1;
++    }
++    const uint64_t gate_bytes = table->gate_expert_bytes;
++    const uint64_t down_bytes = table->down_expert_bytes;
++    const uint64_t p_gate_off = (uint64_t)primary_slot * gate_bytes;
++    const uint64_t p_down_off = (uint64_t)primary_slot * down_bytes;
++    const uint64_t l2_gate_off = (uint64_t)l2_slot * gate_bytes;
++    const uint64_t l2_down_off = (uint64_t)l2_slot * down_bytes;
++    if (!cuda_xdev_copy_raw(l2->gate_ptr + l2_gate_off,
++                            g_gpu[l2_tier].device_id,
++                            primary->gate_ptr + p_gate_off,
++                            g_gpu[primary_tier].device_id, gate_bytes) ||
++        !cuda_xdev_copy_raw(l2->up_ptr + l2_gate_off,
++                            g_gpu[l2_tier].device_id,
++                            primary->up_ptr + p_gate_off,
++                            g_gpu[primary_tier].device_id, gate_bytes) ||
++        !cuda_xdev_copy_raw(l2->down_ptr + l2_down_off,
++                            g_gpu[l2_tier].device_id,
++                            primary->down_ptr + p_down_off,
++                            g_gpu[primary_tier].device_id, down_bytes)) {
++        std::lock_guard<std::mutex> lock(*l2_mutex);
++        l2->slots[l2_slot].claimed = 0;
++        return;
++    }
++    std::lock_guard<std::mutex> lock(*l2_mutex);
++    cuda_stream_expert_cache_slot &entry = l2->slots[l2_slot];
++    entry = primary->slots[primary_slot];
++    entry.age = ++l2->tick;
++    entry.valid = 1;
++    entry.claimed = 0;
++    if (append && l2->count < l2->capacity) l2->count++;
++}
+
+ /* (existing) cuda_stream_expert_cache_find follows... */
+--
+2.39.3

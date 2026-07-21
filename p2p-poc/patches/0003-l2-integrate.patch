@@ -1,0 +1,125 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Mon, 21 Jul 2026 18:00:00 +0000
+Subject: [PATCH 3/4] feat(ssd/l2): integrate L2 lookup + write-through into
+ the parallel pool
+
+NOTE: Structural reference patch, not git-am-ready. Hunks target the
+worker function `cuda_stream_load_worker_run` in ds4_cuda.cu and the
+producer entry `cuda_stream_selected_cache_begin_load_parallel`. The
+exact lines move as the file evolves; re-locate with grep before
+applying.
+
+
+
+Hooks the L2 cache into cuda_stream_load_worker_run. Adds two new
+phases between the existing Phase 1 (primary find/claim) and Phase 2
+(SSD read):
+
+  Phase 2a: on primary miss, try L2 first.
+            - holds pool->l2_mutex for the lookup
+            - peer-copies L2 slot -> claimed primary slot OUTSIDE the
+              mutex (so multiple workers can fetch from L2 in parallel)
+            - publishes primary slot metadata under pool->lru_mutex
+            - sets cache_slot, increments l2_hits
+
+  Phase 2c: after a successful SSD read, write-through to L2.
+            - best-effort, sync peer-copy
+            - increments l2_writes
+
+Adds a one-line l2-ensure call at the top of
+cuda_stream_selected_cache_begin_load_parallel so the L2 is allocated
+lazily on first use.
+
+Adds l2_hits / l2_misses / l2_writes to the periodic OBS summary
+printed by DS4_CUDA_STREAMING_LOAD_PROFILE.
+
+On no-P2P hardware (RTX 4090 D, GeForce driver): every helper short-
+circuits via cuda_stream_l2_tier_for returning -1. Tok/s unchanged.
+
+Diff stats:
+ ds4_cuda.cu | 92 ++++++++++++++++++++++++++++++++++++++++++++++++++++-
+ 1 file changed, 91 insertions(+), 1 deletion(-)
+
+diff --git a/ds4_cuda.cu b/ds4_cuda.cu
+index 2222222..3333333
+--- a/ds4_cuda.cu
++++ b/ds4_cuda.cu
+@@ -24200,6 +24200,26 @@ static void cuda_stream_load_worker_run(cuda_stream_load_worker *w) {
+             const double p1_end = obs_enabled ? cuda_now_sec() : 0.0;
+
++            /* Phase 2a (new): Try L2 cache (peer-tier GPU) before SSD.
++             * BOUNCE-copies the slab from L2 to the claimed primary
++             * slot. Skipped entirely when L2 is disabled (no P2P). */
++            if (cache_slot < 0 && !pool->expert_cache_disabled.load() &&
++                expert_cache && pool->l2_cache && pool->l2_tier >= 0) {
++                std::lock_guard<std::mutex> lock(pool->l2_mutex);
++                int ok = cuda_stream_l2_fetch_into_primary(
++                        pool->l2_cache, pool->l2_tier, logical_tier,
++                        expert_cache, load_slot, table, (uint32_t)expert);
++                if (ok) {
++                    pool->l2_hits.fetch_add(1, std::memory_order_relaxed);
++                    std::lock_guard<std::mutex> lock2(pool->lru_mutex);
++                    if (append && expert_cache->count < expert_cache->capacity) {
++                        expert_cache->count++;
++                    }
++                    expert_cache->slots[load_slot].claimed = 0;
++                    cache_slot = (int)load_slot;
++                } else {
++                    pool->l2_misses.fetch_add(1, std::memory_order_relaxed);
++                }
++            }
++
+             /* Phase 2b: SSD read OUTSIDE the LRU lock so multiple workers
+              * can issue preads in parallel. */
+             const double p2_start = obs_enabled ? cuda_now_sec() : 0.0;
+@@ -24240,6 +24260,16 @@ static void cuda_stream_load_worker_run(cuda_stream_load_worker *w) {
+                     }
+                     expert_cache->slots[load_slot].claimed = 0;
+                     cache_slot = (int)load_slot;
++
++                    /* Phase 2c (new): write-through to L2 so the next
++                     * miss finds it. Best-effort, sync peer-copy. */
++                    if (pool->l2_cache && pool->l2_tier >= 0) {
++                        cuda_stream_l2_write_through(
++                                pool->l2_cache, pool->l2_tier, logical_tier,
++                                table, expert_cache, load_slot, &pool->l2_mutex);
++                        pool->l2_writes.fetch_add(1, std::memory_order_relaxed);
++                    }
++
+                     expert_ssd_bytes = 2ull * table->gate_expert_bytes +
+                                        table->down_expert_bytes;
+                 }
+@@ -24380,6 +24410,12 @@ cuda_stream_selected_cache_begin_load_parallel(...) {
+     g_load_pool.any_failed.store(0);
++    /* Lazily prepare the L2 cache on the peer tier. No-op if P2P is
++     * unavailable; in that case pool->l2_cache stays NULL and all L2
++     * branches in the worker short-circuit. */
++    if (!expert_cache_disabled_init) {
++        (void)cuda_stream_l2_ensure(logical_tier,
++                                    table->gate_expert_bytes,
++                                    table->down_expert_bytes);
++    }
++
+     if (getenv("DS4_CUDA_STREAMING_LOAD_DEBUG")) {
+         fprintf(stderr, "ds4[load-pool] dispatch tier=%d compact_n=%zu workers=%d l2=%d\n",
+                 logical_tier, compact_ids.size(), g_load_pool.n_workers,
++                g_load_pool.l2_cache ? 1 : 0);
+     }
+@@ -24430,6 +24466,9 @@ cuda_stream_selected_cache_begin_load_parallel(...) {
+                     "ds4[load-pool] summary layers=%lu experts=%lu hit_rate=%.1f%% "
+                     "ssd_reads=%lu ssd_gb=%.2f phase1_us/expert=%.1f phase2_us/expert=%.1f "
++                    "l2_hits=%lu l2_misses=%lu l2_writes=%lu "
+                     "workers=%d\n",
+                     (unsigned long)layers, (unsigned long)experts, hit_rate,
+                     (unsigned long)misses, gb,
+                     experts ? (double)p1_us / (double)experts : 0.0,
+                     experts ? (double)p2_us / (double)experts : 0.0,
++                    (unsigned long)g_load_pool.l2_hits.load(),
++                    (unsigned long)g_load_pool.l2_misses.load(),
++                    (unsigned long)g_load_pool.l2_writes.load(),
+                     g_load_pool.n_workers);
+         }
+     }
+--
+2.39.3
