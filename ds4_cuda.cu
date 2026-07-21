@@ -18,6 +18,10 @@
 #include <unordered_map>
 #include <vector>
 #include <algorithm>
+#include <thread>
+#include <mutex>
+#include <condition_variable>
+#include <atomic>
 
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
@@ -23818,6 +23822,546 @@ static int cuda_stream_expert_cache_seed_one(
     return 1;
 }
 
+/* =========================================================================
+ * Parallel SSD streaming load worker pool
+ *
+ * The single-thread producer issues preads sequentially. NVMe SSDs need
+ * queue depth > 1 for full bandwidth; on the test hardware a single pread
+ * sustains ~1.7 GB/s while 4-8 parallel preads reach 5-6 GB/s aggregate
+ * (see `dd if=...iflag=direct` microbenchmarks). The per-layer load issues
+ * 6 experts * 3 weights = 18 reads; running them across N persistent
+ * worker threads (each with its own pinned stage pool + upload stream)
+ * cuts SSD-load latency by ~2-3x on cache misses.
+ *
+ * Default is 4 workers. Override with DS4_CUDA_STREAMING_LOAD_WORKERS=N
+ * (0 or 1 = disabled, falls back to the legacy single-thread path).
+ * ========================================================================= */
+
+struct cuda_stream_stage_pool_ws {
+    int          tier;             /* logical tier this pool is bound to (-1 = unbound) */
+    void        *stage_raw[4];
+    void        *stage[4];
+    cudaEvent_t  stage_event[4];
+    uint64_t     stage_bytes;
+    cudaStream_t upload_stream;
+};
+
+static void cuda_stream_stage_pool_ws_release(cuda_stream_stage_pool_ws *p) {
+    if (!p) return;
+    /* Caller must be on p->tier's device (or CUDA must already be torn down). */
+    for (size_t i = 0; i < 4; i++) {
+        if (p->stage_event[i]) {
+            (void)cudaEventDestroy(p->stage_event[i]);
+            p->stage_event[i] = NULL;
+        }
+        if (p->stage_raw[i]) {
+            (void)cudaFreeHost(p->stage_raw[i]);
+            p->stage_raw[i] = NULL;
+            p->stage[i] = NULL;
+        }
+    }
+    if (p->upload_stream) {
+        (void)cudaStreamDestroy(p->upload_stream);
+        p->upload_stream = NULL;
+    }
+    p->stage_bytes = 0;
+    p->tier = -1;
+}
+
+static int cuda_stream_stage_pool_ws_ensure(cuda_stream_stage_pool_ws *p,
+                                            uint64_t bytes,
+                                            int logical_tier) {
+    if (!p) return 0;
+    if (p->tier == logical_tier && p->stage_bytes >= bytes) return 1;
+    cuda_stream_stage_pool_ws_release(p);
+    if (logical_tier < 0 || logical_tier >= g_n_gpus) return 0;
+    if (cudaSetDevice(g_gpu[logical_tier].device_id) != cudaSuccess) return 0;
+    cudaError_t err = cudaStreamCreateWithFlags(
+            &p->upload_stream, cudaStreamNonBlocking);
+    if (err != cudaSuccess) {
+        (void)cudaGetLastError();
+        return 0;
+    }
+    for (size_t i = 0; i < 4; i++) {
+        err = cudaMallocHost(&p->stage_raw[i], (size_t)bytes);
+        if (err != cudaSuccess) {
+            (void)cudaGetLastError();
+            cuda_stream_stage_pool_ws_release(p);
+            return 0;
+        }
+        p->stage[i] = cuda_align_ptr(p->stage_raw[i], g_model_direct_align);
+        err = cudaEventCreateWithFlags(&p->stage_event[i],
+                                       cudaEventDisableTiming);
+        if (err != cudaSuccess) {
+            (void)cudaGetLastError();
+            cuda_stream_stage_pool_ws_release(p);
+            return 0;
+        }
+    }
+    p->stage_bytes = bytes;
+    p->tier = logical_tier;
+    return 1;
+}
+
+/* Mirror of cuda_model_copy_to_device_streamed that uses an explicit
+ * per-worker stage pool instead of ssd_current()'s shared pool. The read
+ * pipeline (4-stage pread + cudaMemcpyAsync) is identical. */
+static int cuda_model_copy_to_device_streamed_pool(
+        cuda_stream_stage_pool_ws *pool,
+        int logical_tier,
+        char *dst,
+        const void *model_map,
+        uint64_t model_size,
+        uint64_t offset,
+        uint64_t bytes,
+        const char *what) {
+    if (!dst || !model_map || offset > model_size ||
+        bytes > model_size - offset) {
+        return 0;
+    }
+    if (bytes == 0) return 1;
+    if (g_model_fd < 0 ||
+        (g_model_fd_host_base != NULL && model_map != g_model_fd_host_base)) {
+        return cuda_ok(cudaMemcpy(dst,
+                                  (const char *)model_map + offset,
+                                  (size_t)bytes,
+                                  cudaMemcpyHostToDevice),
+                       what ? what : "stream selected expert copy");
+    }
+    const uint64_t chunk = cuda_model_copy_chunk_bytes();
+    const uint64_t stage_bytes =
+        chunk + (g_model_direct_align > 1 ? g_model_direct_align : 1);
+    if (!cuda_stream_stage_pool_ws_ensure(pool, stage_bytes, logical_tier)) {
+        return 0;
+    }
+    uint64_t copied = 0;
+    uint64_t chunk_idx = 0;
+    while (copied < bytes) {
+        const uint64_t n = bytes - copied < chunk ? bytes - copied : chunk;
+        const uint64_t bi = chunk_idx % 4u;
+        cudaError_t err;
+        if (chunk_idx >= 4u) {
+            err = cudaEventSynchronize(pool->stage_event[bi]);
+            if (err != cudaSuccess) {
+                fprintf(stderr,
+                        "ds4: pool streaming staging wait failed for %s: %s\n",
+                        what ? what : "expert", cudaGetErrorString(err));
+                (void)cudaGetLastError();
+                return 0;
+            }
+        }
+        const char *payload = NULL;
+        if (!cuda_model_stage_read(pool->stage[bi],
+                                   pool->stage_bytes,
+                                   offset + copied, n, &payload)) {
+            fprintf(stderr,
+                    "ds4: pool streaming read failed for %s at %.2f MiB: %s\n",
+                    what ? what : "expert", (double)copied / 1048576.0,
+                    strerror(errno));
+            return 0;
+        }
+        err = cudaMemcpyAsync(dst + copied, payload, (size_t)n,
+                              cudaMemcpyHostToDevice,
+                              pool->upload_stream);
+        if (err != cudaSuccess) {
+            fprintf(stderr,
+                    "ds4: pool streaming copy failed for %s at %.2f MiB: %s\n",
+                    what ? what : "expert", (double)copied / 1048576.0,
+                    cudaGetErrorString(err));
+            (void)cudaGetLastError();
+            return 0;
+        }
+        err = cudaEventRecord(pool->stage_event[bi],
+                              pool->upload_stream);
+        if (err != cudaSuccess) {
+            fprintf(stderr,
+                    "ds4: pool streaming staging record failed for %s: %s\n",
+                    what ? what : "expert", cudaGetErrorString(err));
+            (void)cudaGetLastError();
+            return 0;
+        }
+        cuda_model_drop_file_pages(offset + copied, n);
+        cuda_model_discard_source_pages(model_map, model_size,
+                                        offset + copied, n);
+        copied += n;
+        chunk_idx++;
+    }
+    const cudaError_t err =
+        cudaStreamSynchronize(pool->upload_stream);
+    if (err != cudaSuccess) {
+        fprintf(stderr,
+                "ds4: pool streaming upload sync failed for %s: %s\n",
+                what ? what : "expert", cudaGetErrorString(err));
+        (void)cudaGetLastError();
+        return 0;
+    }
+    return 1;
+}
+
+/* Per-tier LRU cache load_slot using a worker's pool (parallel-safe). */
+static int cuda_stream_expert_cache_load_slot_pool(
+        cuda_stream_expert_cache *cache,
+        cuda_stream_stage_pool_ws *pool,
+        int logical_tier,
+        const void *model_map,
+        uint64_t model_size,
+        uint32_t slot,
+        uint32_t layer,
+        uint32_t n_total_expert,
+        uint32_t expert,
+        uint64_t gate_offset,
+        uint64_t up_offset,
+        uint64_t down_offset,
+        uint64_t gate_expert_bytes,
+        uint64_t down_expert_bytes) {
+    const uint64_t gate_src =
+        gate_offset + (uint64_t)expert * gate_expert_bytes;
+    const uint64_t up_src =
+        up_offset + (uint64_t)expert * gate_expert_bytes;
+    const uint64_t down_src =
+        down_offset + (uint64_t)expert * down_expert_bytes;
+    const uint64_t gate_dst = (uint64_t)slot * gate_expert_bytes;
+    const uint64_t down_dst = (uint64_t)slot * down_expert_bytes;
+    if (!cuda_model_copy_to_device_streamed_pool(pool, logical_tier,
+                                                 cache->gate_ptr + gate_dst,
+                                                 model_map, model_size,
+                                                 gate_src, gate_expert_bytes,
+                                                 "cached moe_gate") ||
+        !cuda_model_copy_to_device_streamed_pool(pool, logical_tier,
+                                                 cache->up_ptr + gate_dst,
+                                                 model_map, model_size,
+                                                 up_src, gate_expert_bytes,
+                                                 "cached moe_up") ||
+        !cuda_model_copy_to_device_streamed_pool(pool, logical_tier,
+                                                 cache->down_ptr + down_dst,
+                                                 model_map, model_size,
+                                                 down_src, down_expert_bytes,
+                                                 "cached moe_down")) {
+        return 0;
+    }
+    cuda_stream_expert_cache_slot &entry = cache->slots[slot];
+    entry.valid = 1;
+    entry.model_map = model_map;
+    entry.model_size = model_size;
+    entry.layer = layer;
+    entry.n_total_expert = n_total_expert;
+    entry.expert = expert;
+    entry.gate_offset = gate_offset;
+    entry.up_offset = up_offset;
+    entry.down_offset = down_offset;
+    entry.gate_expert_bytes = gate_expert_bytes;
+    entry.down_expert_bytes = down_expert_bytes;
+    entry.age = ++cache->tick;
+    return 1;
+}
+
+struct cuda_stream_load_pool;
+
+struct cuda_stream_load_worker {
+    std::thread thread;
+    int worker_idx;
+    cuda_stream_stage_pool_ws stage_pool;
+    cuda_stream_load_pool *pool;
+    std::mutex mutex;
+    std::condition_variable cv;
+    int has_job;
+    int done;
+    int exit;
+};
+
+struct cuda_stream_load_pool {
+    int n_workers;
+    std::vector<std::unique_ptr<cuda_stream_load_worker>> workers;
+    std::once_flag init_flag;
+    int initialized;
+
+    /* Job state (written by main, read by workers under workers[i].mutex) */
+    const ds4_gpu_stream_expert_table *table;
+    cuda_stream_expert_cache *expert_cache;
+    cuda_stream_selected_cache *sc;
+    int logical_tier;
+    const std::vector<int32_t> *compact_ids;
+    std::mutex lru_mutex;
+    std::atomic<int> next_idx;
+    std::atomic<int> expert_cache_disabled;
+    std::atomic<int> any_failed;
+};
+
+static cuda_stream_load_pool g_load_pool = {};
+
+static int cuda_stream_load_workers_count(void) {
+    int n = 4;
+    const char *env = getenv("DS4_CUDA_STREAMING_LOAD_WORKERS");
+    if (env && env[0]) {
+        int v = atoi(env);
+        if (v >= 0 && v <= 16) n = v;
+    }
+    return n;
+}
+
+static void cuda_stream_load_worker_run(cuda_stream_load_worker *w) {
+    if (getenv("DS4_CUDA_STREAMING_LOAD_DEBUG")) {
+        fprintf(stderr, "ds4[load-pool] worker %d started\n", w->worker_idx);
+    }
+    for (;;) {
+        {
+            std::unique_lock<std::mutex> lock(w->mutex);
+            w->cv.wait(lock, [w]{ return w->has_job || w->exit; });
+            if (w->exit) return;
+        }
+        cuda_stream_load_pool *pool = w->pool;
+        const int logical_tier = pool->logical_tier;
+
+        /* Set this thread's current device so ssd-aware helpers resolve
+         * correctly. ds4_gpu_set_current_device caches per-thread. */
+        if (logical_tier >= 0 && logical_tier < g_n_gpus) {
+            (void)ds4_gpu_set_current_device(logical_tier);
+        }
+        if (getenv("DS4_CUDA_STREAMING_LOAD_DEBUG")) {
+            fprintf(stderr, "ds4[load-pool] worker %d woke job tier=%d compact_n=%zu\n",
+                    w->worker_idx, logical_tier, pool->compact_ids->size());
+        }
+
+        const ds4_gpu_stream_expert_table *table = pool->table;
+        cuda_stream_expert_cache *expert_cache = pool->expert_cache;
+        cuda_stream_selected_cache *sc = pool->sc;
+        const std::vector<int32_t> &compact_ids = *pool->compact_ids;
+
+        for (;;) {
+            if (pool->any_failed.load()) break;
+            const int i = pool->next_idx.fetch_add(1);
+            if (i < 0 || (size_t)i >= compact_ids.size()) break;
+            const uint64_t expert = (uint32_t)compact_ids[(size_t)i];
+            const uint64_t gate_dst = (uint64_t)i * table->gate_expert_bytes;
+            const uint64_t down_dst = (uint64_t)i * table->down_expert_bytes;
+
+            int cache_slot = -1;
+            uint32_t load_slot = 0;
+            int append = 0;
+            int copied_from_global_cache = 0;
+
+            /* Phase 1: cache find/claim under the shared LRU lock. */
+            {
+                std::lock_guard<std::mutex> lock(pool->lru_mutex);
+                if (!pool->expert_cache_disabled.load() && expert_cache) {
+                    cache_slot = cuda_stream_expert_cache_find(
+                            expert_cache,
+                            table->model_map, table->model_size,
+                            table->layer, table->n_total_expert,
+                            (uint32_t)expert,
+                            table->gate_offset, table->up_offset, table->down_offset,
+                            table->gate_expert_bytes, table->down_expert_bytes);
+                    if (cache_slot >= 0) {
+                        expert_cache->slots[(uint32_t)cache_slot].age =
+                            ++expert_cache->tick;
+                    } else {
+                        load_slot = cuda_stream_expert_cache_lru_slot(expert_cache);
+                        append = !expert_cache->slots[load_slot].valid;
+                        /* Mark in-use so concurrent workers don't pick it. */
+                        expert_cache->slots[load_slot].valid = 0;
+                    }
+                }
+            }
+
+            /* Phase 2: SSD read OUTSIDE the LRU lock so multiple workers
+             * can issue preads in parallel. Each worker uses its own
+             * stage pool + upload stream. */
+            if (cache_slot < 0 && !pool->expert_cache_disabled.load() && expert_cache) {
+                int ok = cuda_stream_expert_cache_load_slot_pool(
+                        expert_cache, &w->stage_pool, logical_tier,
+                        table->model_map, table->model_size,
+                        load_slot,
+                        table->layer, table->n_total_expert,
+                        (uint32_t)expert,
+                        table->gate_offset, table->up_offset, table->down_offset,
+                        table->gate_expert_bytes, table->down_expert_bytes);
+                if (!ok) {
+                    pool->expert_cache_disabled.store(1);
+                } else {
+                    std::lock_guard<std::mutex> lock(pool->lru_mutex);
+                    if (append && expert_cache->count < expert_cache->capacity) {
+                        expert_cache->count++;
+                    }
+                    cache_slot = (int)load_slot;
+                }
+            }
+
+            /* Phase 3: D2D copy from LRU to compact (small, on-device). */
+            if (cache_slot >= 0 && !pool->expert_cache_disabled.load() && expert_cache) {
+                std::lock_guard<std::mutex> lock(pool->lru_mutex);
+                copied_from_global_cache =
+                    cuda_stream_expert_cache_copy_to_compact(
+                            expert_cache,
+                            (uint32_t)cache_slot, (uint32_t)i,
+                            sc->gate_ptr, sc->up_ptr, sc->down_ptr);
+                if (!copied_from_global_cache) {
+                    pool->expert_cache_disabled.store(1);
+                }
+            }
+
+            /* Fallback: direct SSD -> compact (no LRU). Uses worker pool. */
+            if (!copied_from_global_cache) {
+                const uint64_t gate_src =
+                    table->gate_offset + expert * table->gate_expert_bytes;
+                const uint64_t up_src =
+                    table->up_offset + expert * table->gate_expert_bytes;
+                const uint64_t down_src =
+                    table->down_offset + expert * table->down_expert_bytes;
+                if (!cuda_model_copy_to_device_streamed_pool(
+                            &w->stage_pool, logical_tier,
+                            sc->gate_ptr + gate_dst,
+                            table->model_map, table->model_size,
+                            gate_src, table->gate_expert_bytes,
+                            "stream gate expert copy") ||
+                    !cuda_model_copy_to_device_streamed_pool(
+                            &w->stage_pool, logical_tier,
+                            sc->up_ptr + gate_dst,
+                            table->model_map, table->model_size,
+                            up_src, table->gate_expert_bytes,
+                            "stream up expert copy") ||
+                    !cuda_model_copy_to_device_streamed_pool(
+                            &w->stage_pool, logical_tier,
+                            sc->down_ptr + down_dst,
+                            table->model_map, table->model_size,
+                            down_src, table->down_expert_bytes,
+                            "stream down expert copy")) {
+                    pool->any_failed.store(1);
+                    break;
+                }
+            }
+        }
+
+        {
+            std::unique_lock<std::mutex> lock(w->mutex);
+            w->has_job = 0;
+            w->done = 1;
+            w->cv.notify_all();
+        }
+        if (getenv("DS4_CUDA_STREAMING_LOAD_DEBUG")) {
+            fprintf(stderr, "ds4[load-pool] worker %d done\n", w->worker_idx);
+        }
+    }
+}
+
+static void cuda_stream_load_pool_init(void) {
+    int n = cuda_stream_load_workers_count();
+    if (n <= 1) {
+        g_load_pool.n_workers = 0;
+        g_load_pool.initialized = 1;
+        return;
+    }
+    g_load_pool.n_workers = n;
+    g_load_pool.workers.reserve(n);
+    for (int i = 0; i < n; i++) {
+        std::unique_ptr<cuda_stream_load_worker> w(
+                new cuda_stream_load_worker());
+        w->worker_idx = i;
+        w->pool = &g_load_pool;
+        w->stage_pool.tier = -1;
+        memset(w->stage_pool.stage_raw, 0, sizeof(w->stage_pool.stage_raw));
+        memset(w->stage_pool.stage, 0, sizeof(w->stage_pool.stage));
+        memset(w->stage_pool.stage_event, 0, sizeof(w->stage_pool.stage_event));
+        w->stage_pool.stage_bytes = 0;
+        w->stage_pool.upload_stream = NULL;
+        w->has_job = 0;
+        w->done = 0;
+        w->exit = 0;
+        cuda_stream_load_worker *wp = w.get();
+        w->thread = std::thread(cuda_stream_load_worker_run, wp);
+        g_load_pool.workers.push_back(std::move(w));
+    }
+    g_load_pool.initialized = 1;
+}
+
+static int cuda_stream_load_pool_enabled(void) {
+    std::call_once(g_load_pool.init_flag, cuda_stream_load_pool_init);
+    return g_load_pool.n_workers > 0;
+}
+
+/* Dispatch a parallel load and wait for all workers to finish. Returns 1 on
+ * success, 0 on any failure. Caller has already prepared compact_ids and
+ * ensured the sc buffers, just like the sequential path. */
+static int cuda_stream_selected_cache_begin_load_parallel(
+        const ds4_gpu_stream_expert_table *table,
+        const std::vector<int32_t> &compact_ids,
+        const std::vector<int32_t> &slot_ids,
+        cuda_stream_selected_cache *sc,
+        int logical_tier,
+        uint32_t slot_count,
+        int expert_cache_disabled_init,
+        cuda_stream_expert_cache *expert_cache) {
+    if (!cuda_stream_load_pool_enabled()) return -1;
+    if (compact_ids.empty()) return 1;
+
+    /* Reset shared job state. */
+    g_load_pool.table = table;
+    g_load_pool.expert_cache = expert_cache;
+    g_load_pool.sc = sc;
+    g_load_pool.logical_tier = logical_tier;
+    g_load_pool.compact_ids = &compact_ids;
+    g_load_pool.next_idx.store(0);
+    g_load_pool.expert_cache_disabled.store(expert_cache_disabled_init);
+    g_load_pool.any_failed.store(0);
+    if (getenv("DS4_CUDA_STREAMING_LOAD_DEBUG")) {
+        fprintf(stderr, "ds4[load-pool] dispatch tier=%d compact_n=%zu workers=%d\n",
+                logical_tier, compact_ids.size(), g_load_pool.n_workers);
+    }
+
+    /* Dispatch: wake all workers. */
+    for (int i = 0; i < g_load_pool.n_workers; i++) {
+        cuda_stream_load_worker *w = g_load_pool.workers[i].get();
+        std::lock_guard<std::mutex> lock(w->mutex);
+        w->has_job = 1;
+        w->done = 0;
+        w->cv.notify_one();
+    }
+
+    /* Wait for all workers to finish. */
+    for (int i = 0; i < g_load_pool.n_workers; i++) {
+        cuda_stream_load_worker *w = g_load_pool.workers[i].get();
+        std::unique_lock<std::mutex> lock(w->mutex);
+        w->cv.wait(lock, [w]{ return w->done == 1; });
+        w->done = 0;
+    }
+    if (getenv("DS4_CUDA_STREAMING_LOAD_DEBUG")) {
+        fprintf(stderr, "ds4[load-pool] all workers returned failed=%d\n",
+                g_load_pool.any_failed.load());
+    }
+
+    if (g_load_pool.any_failed.load()) {
+        return 0;
+    }
+
+    /* Copy slot_ids and publish the cache metadata (must match the
+     * sequential path's tail exactly). */
+    if (!cuda_ok(cudaMemcpy(sc->slot_selected_ptr,
+                            slot_ids.data(),
+                            (size_t)slot_count * sizeof(int32_t),
+                            cudaMemcpyHostToDevice),
+                 "stream selected-id remap copy")) {
+        cuda_stream_selected_cache_invalidate();
+        return 0;
+    }
+    sc->logical_tier = logical_tier;
+    sc->model_map = table->model_map;
+    sc->layer = table->layer;
+    sc->n_total_expert = table->n_total_expert;
+    sc->slot_count = slot_count;
+    sc->compact_count = (uint32_t)compact_ids.size();
+    sc->gate_offset = table->gate_offset;
+    sc->up_offset = table->up_offset;
+    sc->down_offset = table->down_offset;
+    sc->gate_expert_bytes = table->gate_expert_bytes;
+    sc->down_expert_bytes = table->down_expert_bytes;
+    sc->slot_selected_tensor.ptr = sc->slot_selected_ptr;
+    sc->slot_selected_tensor.bytes =
+        (uint64_t)slot_count * sizeof(int32_t);
+    sc->slot_selected_tensor.owner = 0;
+    sc->slot_selected_tensor.device_id = logical_tier;
+    sc->valid = 1;
+    return 1;
+}
+
 static int cuda_stream_selected_cache_begin_load(
         const ds4_gpu_stream_expert_table *table,
         const int32_t *selected_ids,
@@ -23922,6 +24466,18 @@ static int cuda_stream_selected_cache_begin_load(
                                          configured_cache_budget) :
         NULL;
     int expert_cache_disabled = expert_cache == NULL;
+
+    /* Parallel SSD streaming load: when the worker pool is enabled (default
+     * 4 workers, controlled by DS4_CUDA_STREAMING_LOAD_WORKERS), dispatch
+     * the per-expert reads across N threads to break the single-thread
+     * pread bottleneck (NVMe needs queue depth > 1 for full bandwidth).
+     * The workers each have their own pinned stage pool + upload stream;
+     * LRU cache mutations are guarded by a shared mutex. */
+    if (cuda_stream_load_pool_enabled()) {
+        return cuda_stream_selected_cache_begin_load_parallel(
+                table, compact_ids, slot_ids, sc, logical_tier,
+                slot_count, expert_cache_disabled, expert_cache);
+    }
 
     for (uint32_t i = 0; i < compact_ids.size(); i++) {
         const uint64_t expert = (uint32_t)compact_ids[i];
