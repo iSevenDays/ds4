@@ -16788,6 +16788,16 @@ static bool metal_graph_alloc_raw_cap(
                                 metal_graph_cuda_tp_attn_cache_dup_requested();
     g->cuda_tp_moe = g->cuda_tp_decode && metal_graph_cuda_tp_moe_requested();
     g->cuda_tp_ep = g->cuda_tp_moe && cuda_tensor_parallel;
+    /* SSD streaming coexistence: when experts stream per-tier from the SSD
+     * LRU, force the runtime expert-sharding flags off so the decode loop
+     * takes the non-TP `ds4_gpu_routed_moe_one_tensor` path (which reads
+     * ssd_current()->selected_cache). The TP-style placement is preserved,
+     * so attention/dense TP still runs with partner-tier replication. The
+     * cuda_tp_ep_pack_exact flag is folded away with cuda_tp_ep. */
+    if (g->ssd_streaming) {
+        g->cuda_tp_moe = false;
+        g->cuda_tp_ep = false;
+    }
     g->cuda_tp_ep_pack_exact =
         g->cuda_tp_ep && metal_graph_cuda_tp_ep_pack_exact_requested();
     g->cuda_tp_moe_delay_reduce = metal_graph_cuda_tp_moe_delay_reduce_requested();
@@ -54276,6 +54286,7 @@ static bool engine_deepseek_routed_expert_tensor(
 
 static bool engine_cuda_tp_decode_requested(const ds4_engine *e);
 static bool engine_cuda_tp_ep_requested(const ds4_engine *e);
+static bool engine_cuda_tp_placement_requested(const ds4_engine *e);
 static bool engine_cuda_tp_output_env_requested(void);
 
 /* Compute per-entry byte footprint estimates. Walks the tensor table once
@@ -54284,18 +54295,18 @@ static bool engine_cuda_tp_output_env_requested(void);
  * requirements (not just weight bytes). Returns 0 on success. */
 static int engine_compute_entry_bytes(const ds4_engine *e, size_t *out) {
     const int n_entries = DS4_N_LAYER + 2;
+    /* Under SSD streaming the routed-expert weights (the bulk of an MoE
+     * model) are served from host/disk by the per-tier SSD caches, not
+     * loaded resident, even when CUDA tensor parallelism is on. In that
+     * case the engine_cuda_tp_ep_requested() helper returns false (experts
+     * are not resident) so the packer sizes only dense weights + KV; the
+     * per-tier expert cache is grown lazily at runtime out of each tier's
+     * free VRAM. Without this, the packer refuses CPU-spill for a model
+     * whose routed experts were never going to be resident anyway.
+     * Under CUDA TP without SSD the experts are sharded resident, so they
+     * must stay in the budget. */
     const bool cuda_tp_ep = engine_cuda_tp_ep_requested(e);
-    /* When SSD streaming is on AND we are NOT using CUDA tensor parallelism,
-     * the routed-expert weights (the bulk of an MoE model) are served from
-     * host/disk by the per-tier SSD caches, not loaded resident. Exclude
-     * them from the placement budget so the packer sizes only dense weights
-     * + KV; the per-tier expert cache is grown lazily at runtime out of each
-     * tier's free VRAM. Without this, the packer refuses CPU-spill for a
-     * model whose routed experts were never going to be resident anyway.
-     * Under CUDA TP the experts are sharded resident, so they must stay in
-     * the budget. */
-    const bool ssd_excludes_routed =
-        e->ssd_streaming && !cuda_tp_ep;
+    const bool ssd_excludes_routed = e->ssd_streaming;
     for (int i = 0; i < n_entries; i++) out[i] = 0;
 
     for (uint64_t i = 0; i < e->model.n_tensors; i++) {
@@ -54364,6 +54375,32 @@ static bool engine_cuda_tp_decode_requested(const ds4_engine *e) {
 }
 
 static bool engine_cuda_tp_ep_requested(const ds4_engine *e) {
+#if defined(__APPLE__) && !defined(DS4_TEST_HOOKS)
+    (void)e;
+    return false;
+#else
+    /* Under SSD streaming the routed-expert weights are served per-tier from
+     * the SSD LRU rather than sharded resident. Force the runtime EP flag
+     * off in that case so (a) the budget excludes routed experts, (b) the
+     * per-device cache install skips them, and (c) the matmul takes the
+     * non-TP `ds4_gpu_routed_moe_one_tensor` path that reads
+     * ssd_current()->selected_cache. The placement structure is preserved
+     * via engine_cuda_tp_placement_requested(). */
+    if (e && e->ssd_streaming) return false;
+    return engine_cuda_tp_decode_requested(e) &&
+           g_ds4_shape.family == DS4_MODEL_FAMILY_DEEPSEEK4 &&
+           DS4_N_EXPERT != 0u && (DS4_N_EXPERT & 1u) == 0u;
+#endif
+}
+
+/* Placement-only signal: returns true when the EP-style placement structure
+ * (all layers on lower-half tiers, partners mirrored in the upper half) is
+ * needed. This is what engine_cuda_tp_ep_requested() used to mean before SSD
+ * streaming was allowed to coexist with TP: under SSD+TP we still want the
+ * EP placement so that attention TP can run with partner-tier replication,
+ * but the runtime expert path is routed through the SSD LRU (see
+ * engine_cuda_tp_ep_requested above). */
+static bool engine_cuda_tp_placement_requested(const ds4_engine *e) {
 #if defined(__APPLE__) && !defined(DS4_TEST_HOOKS)
     (void)e;
     return false;
@@ -54707,11 +54744,15 @@ static int engine_classify_multi_tier(ds4_engine *e, const ds4_gpu_config *cfg) 
         pcfg.gpu_budget_bytes[d] = budget > reserve ? budget - reserve : 0;
     }
 
-    const bool cuda_tp_ep = engine_cuda_tp_ep_requested(e);
-    if (cuda_tp_ep && engine_reserve_cuda_ep_output_shards(e, &pcfg) != 0) {
+    /* Placement-only signal: under SSD streaming + TP we keep the EP-style
+     * placement structure (all layers on lower-half tiers, partners mirrored
+     * in the upper half) so attention TP can run with partner replication,
+     * even though the runtime expert path falls back to the SSD LRU. */
+    const bool cuda_tp_placement = engine_cuda_tp_placement_requested(e);
+    if (cuda_tp_placement && engine_reserve_cuda_ep_output_shards(e, &pcfg) != 0) {
         return -1;
     }
-    const int placement_rc = cuda_tp_ep
+    const int placement_rc = cuda_tp_placement
         ? engine_compute_cuda_ep_placement(entry_bytes, DS4_N_LAYER + 2,
                                            &pcfg, e->placement)
         : ds4_compute_layer_placement(entry_bytes, DS4_N_LAYER + 2, &pcfg,
@@ -54732,7 +54773,7 @@ static int engine_classify_multi_tier(ds4_engine *e, const ds4_gpu_config *cfg) 
      * weights are tiny relative to the per-tier budget, so this never
      * causes CPU-spill. Under CUDA TP this is skipped: TP needs the
      * sharded placement produced by engine_compute_cuda_ep_placement. */
-    if (e->ssd_streaming && !cuda_tp_ep && e->gpu_cfg.n_gpus >= 2) {
+    if (e->ssd_streaming && !cuda_tp_placement && e->gpu_cfg.n_gpus >= 2) {
         engine_balance_placement_for_ssd(e, &e->gpu_cfg);
     }
 
@@ -55757,12 +55798,18 @@ static int ds4_engine_open_internal(ds4_engine **out,
         return 1;
     }
     if (e->ssd_streaming && e->multi_tier && e->cuda_tensor_parallel) {
+        /* Experimental: SSD streaming + CUDA tensor parallelism coexistence.
+         * We keep the EP-style placement (all layers on lower-half tiers,
+         * partners mirrored in the upper half) so attention/dense TP runs
+         * with partner replication, but disable the runtime expert-sharding
+         * path (cuda_tp_moe / cuda_tp_ep) so the routed-expert matmul takes
+         * the non-TP `ds4_gpu_routed_moe_one_tensor` path that reads
+         * ssd_current()->selected_cache. The effect: attention is TP'd
+         * (both GPUs compute it simultaneously) while experts stream per-
+         * tier from the SSD LRU on the home tier. */
         fprintf(stderr,
-                "ds4: --ssd-streaming is not compatible with CUDA tensor parallelism "
-                "(TP keeps half the routed experts resident per tier; SSD streams them)\n");
-        ds4_engine_close(e);
-        *out = NULL;
-        return 1;
+                "ds4: --ssd-streaming + --cuda-tensor-parallel experimental coexistence: "
+                "attention/dense TP ON, routed-expert sharding OFF (SSD LRU per tier)\n");
     }
     if (gpu_cfg && e->n_placement_entries > 0) {
         int spilled = 0;
