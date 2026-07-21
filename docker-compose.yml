@@ -1,0 +1,33 @@
+# Serve the DeepSeek-V4-Flash GGUF on 2x RTX 4090 D 48GB with the ds4 mgpu fork.
+#
+# The model already lives in ./gguf/ (81GB) — bind-mounted read-only here, so
+# nothing is copied and no extra disk is used.
+#
+#   docker compose up -d && docker compose logs -f ds4
+#   health check:   curl http://localhost:8001/
+
+services:
+  ds4:
+    build:
+      context: .
+      args:
+        CUDA_ARCH: sm_89           # RTX 4090 D 48GB (Ada Lovelace)
+    image: ds4-mgpu:sm89
+    container_name: ds4
+    restart: unless-stopped
+    init: true
+    ports:
+      - "8001:8000"              # host 8001 -> container 8000 (http://localhost:8001)
+    volumes:
+      - ./gguf:/models:ro              # bind-mount the existing 81GB model, read-only (no copy)
+    environment:
+      DS4_MODEL: /models/DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix.gguf
+      DS4_GPU_VRAM: "46,46"                   # verified fit on 2x 4090D (47.4GB free/card); needs ~46GB free/card
+      DS4_CTX: "16384"                        # max ctx that fits at 46,46; first start is silent ~4 min (graph build) before "listening"
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]

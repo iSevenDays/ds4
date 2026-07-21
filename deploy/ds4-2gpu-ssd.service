@@ -1,0 +1,24 @@
+[Unit]
+Description=ds4 DeepSeek-V4-Flash IQ2 @ 131k — 2-GPU + CUDA SSD streaming (merged antirez+mgpu+ssd)
+After=network.target
+# Native build at /root/antirez/ds4 (branch feat/mgpu-ssd, antirez/main merged).
+# Streams expert weights from SSD; large per-device cache keeps the working set in VRAM.
+# Observability: journalctl -u ds4-2gpu-ssd , /var/log/ds4-2gpu-ssd.log
+
+[Service]
+Type=simple
+WorkingDirectory=/root/antirez/ds4
+Environment=LD_LIBRARY_PATH=/usr/local/cuda/lib64
+Environment=DS4_CUDA_STREAMING_EXPERT_CACHE_RESERVE_GB=4
+# Optimal cache set from the benchmark sweep (~max VRAM utilization). Tune DS4_SSD_CACHE if needed.
+ExecStart=/root/antirez/ds4/ds4-server --cuda --ssd-streaming --ssd-streaming-cache-experts 40GB --gpu-vram 45,45 --ctx 131072 -m /root/antirez/ds4/gguf/DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix.gguf --host 0.0.0.0 --port 8002
+Restart=on-failure
+RestartSec=10
+LimitNOFILE=65536
+OOMScoreAdjust=1000
+StandardOutput=append:/var/log/ds4-2gpu-ssd.log
+StandardError=append:/var/log/ds4-2gpu-ssd.log
+SyslogIdentifier=ds4-2gpu-ssd
+
+[Install]
+WantedBy=multi-user.target
