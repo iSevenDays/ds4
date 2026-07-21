@@ -1269,13 +1269,26 @@ static const __half *cuda_q8_f16_ptr(
      *  - Multi-tier (g_n_gpus > 1): the per-device selective cache must
      *    already contain the weight on expected_device. Use the strict
      *    lookup; on miss this is a placement bug and we hard-fail.
+     *
+     *  Support-map tensors (MTP/DSpark) are keyed in g_cache_ranges at
+     *  offset + g_support_offset_bias (the install path at
+     *  ds4_gpu_device_cache_support_tensors applies that bias to keep their
+     *  keys disjoint from the main model). Mirror the translation that
+     *  cuda_resolve_weight_ptr applies so support-file weights resolve
+     *  instead of producing a false "placement bug" miss. Use a local
+     *  biased offset; the caller's `offset` is also the g_q8_f16_ranges
+     *  key (line ~1335) and must stay unbiased.
      */
     const char *q8;
     if (g_n_gpus <= 1) {
         q8 = cuda_model_range_ptr(model_map, offset, weight_bytes, "q8_0");
     } else {
+        uint64_t lookup_off = offset;
+        if (g_support_host_base && model_map == g_support_host_base) {
+            lookup_off += g_support_offset_bias;
+        }
         void *strict_ptr = NULL;
-        if (!ds4_gpu_lookup_cache_strict(offset, weight_bytes, expected_device, &strict_ptr) ||
+        if (!ds4_gpu_lookup_cache_strict(lookup_off, weight_bytes, expected_device, &strict_ptr) ||
             !strict_ptr) {
             fprintf(stderr,
                 "ds4: q8 fp16 cache miss: source bytes not in selective cache for "
@@ -1379,13 +1392,18 @@ static float *cuda_q8_f32_ptr(
     if (!cuda_q8_f32_cache_allowed(label, in_dim, out_dim)) return NULL;
 
     /* Source Q8 bytes: legacy path in single-tier; strict per-device lookup
-     * in multi-tier (same rationale as cuda_q8_f16_ptr). */
+     * in multi-tier (same rationale as cuda_q8_f16_ptr — including the
+     * support-map bias translation; see the longer comment there). */
     const char *q8;
     if (g_n_gpus <= 1) {
         q8 = cuda_model_range_ptr(model_map, offset, weight_bytes, label ? label : "q8_0");
     } else {
+        uint64_t lookup_off = offset;
+        if (g_support_host_base && model_map == g_support_host_base) {
+            lookup_off += g_support_offset_bias;
+        }
         void *strict_ptr = NULL;
-        if (!ds4_gpu_lookup_cache_strict(offset, weight_bytes, expected_device, &strict_ptr) ||
+        if (!ds4_gpu_lookup_cache_strict(lookup_off, weight_bytes, expected_device, &strict_ptr) ||
             !strict_ptr) {
             fprintf(stderr,
                 "ds4: q8 fp32 cache miss: source bytes not in selective cache for "
