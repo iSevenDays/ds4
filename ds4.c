@@ -16768,6 +16768,7 @@ static bool metal_graph_alloc_raw_cap(
         bool                    enable_mtp,
         const int              *placement,
         bool                    cuda_tensor_parallel,
+        bool                    ssd_streaming,
         const ds4_gpu_graph    *shared_prefill_workspace) {
     const int saved_dspark_exec_tier = g->dspark_exec_tier;
     memset(g, 0, sizeof(*g));
@@ -16775,6 +16776,12 @@ static bool metal_graph_alloc_raw_cap(
     g->owns_prefill_workspace = shared_prefill_workspace == NULL;
     g->cpu_router_norm = xmalloc((size_t)DS4_N_EMBD * sizeof(g->cpu_router_norm[0]));
     g->active_tier = placement ? -1 : 0;
+    /* Persist ssd_streaming up front so the runtime cuda_tp_moe /
+     * cuda_tp_ep force-off below can key off it. (Callers that don't
+     * know the engine's ssd_streaming flag pass false here, then set
+     * g->ssd_streaming themselves after the call returns — that later
+     * assignment is still respected by the decode dispatch loops.) */
+    g->ssd_streaming = ssd_streaming;
     /* cache placement on the graph so the dispatch loops can
      * walk it without threading the engine pointer through every
      * kernel-dispatch wrapper. NULL in single-tier callers (placement
@@ -17386,7 +17393,7 @@ static bool metal_graph_alloc(
     /* single-tier convenience wrapper; placement=NULL routes
      * all per-layer allocations to tier 0. */
     return metal_graph_alloc_raw_cap(g, weights, layer, DS4_N_SWA, DS4_N_SWA,
-                                     1, false, NULL, false, NULL);
+                                     1, false, NULL, false, false, NULL);
 }
 
 static bool metal_graph_install_model_spans(
@@ -35142,7 +35149,7 @@ static int metal_graph_prompt_logits_test(
     /* diagnostic single-tier callsite; placement=NULL. */
     bool ok = metal_graph_alloc_raw_cap(&g, weights, &weights->layer[0],
                                         raw_cap, (uint32_t)ctx_size,
-                                        (uint32_t)n_test, false, NULL, false, NULL);
+                                        (uint32_t)n_test, false, NULL, false, false, NULL);
     if (!ok) {
         metal_graph_free(&g);
         fprintf(stderr, "ds4: failed to initialize Metal graph prompt test runtime\n");
@@ -46867,7 +46874,7 @@ static int generate_metal_graph_raw_swa(
     /* diagnostic single-tier callsite; placement=NULL. */
     bool ok = metal_graph_alloc_raw_cap(&g, weights, &weights->layer[0],
                                         raw_cap, (uint32_t)ctx_size,
-                                        prefill_cap, false, NULL, false, NULL);
+                                        prefill_cap, false, NULL, false, false, NULL);
     if (!ok) {
         fprintf(stderr, "ds4: failed to allocate GPU graph runtime\n");
         return 1;
@@ -50665,7 +50672,7 @@ int ds4_engine_collect_imatrix(ds4_engine *e,
     /* diagnostic single-tier callsite; placement=NULL. */
     bool ok = metal_graph_alloc_raw_cap(&g, weights, &weights->layer[0],
                                         raw_cap, (uint32_t)ctx_size,
-                                        prefill_cap, false, NULL, false, NULL);
+                                        prefill_cap, false, NULL, false, false, NULL);
     if (!ok) {
         fprintf(stderr, "ds4: failed to allocate imatrix Metal graph runtime\n");
         free(dataset);
@@ -54787,6 +54794,16 @@ static int engine_classify_multi_tier(ds4_engine *e, const ds4_gpu_config *cfg) 
             if (e->placement[i] == DS4_LAYER_PACK_CPU) { multi_tier = 1; break; }
         }
     }
+    /* CUDA TP placement collapses every layer onto the lower-half tiers (for
+     * 2 GPUs that is just tier 0) with the upper-half tier participating as
+     * a mirrored TP partner. The placement table only records the home tier
+     * so the loop above sees a single tier and reports multi_tier=0; that
+     * would later short-circuit placement to NULL in session creation and
+     * silently disable TP. Force multi_tier=1 whenever the TP placement
+     * structure is active so the runtime propagates e->placement into the
+     * graph (and so engine_install_gpu_placement installs per-device caches
+     * for the partner tier). */
+    if (!multi_tier && cuda_tp_placement) multi_tier = 1;
     e->multi_tier = multi_tier;
     return 0;
 }
@@ -55108,10 +55125,18 @@ static int engine_install_dspark_support_cache(ds4_engine *e) {
     if (exec_tier < 0 || exec_tier >= e->gpu_cfg.n_gpus) exec_tier = 0;
     const bool tp_decode = e->cuda_tensor_parallel;
     const int tp_half = e->gpu_cfg.n_gpus / 2;
-    if (tp_decode && e->gpu_cfg.n_gpus >= 2 && exec_tier < tp_half) {
+    /* Under SSD streaming + TP the decode runs on the lower-half (home) tier
+     * because routed experts are not sharded. DSpark capture reads
+     * metal_graph_cur_hc(g) (the decode activations) and writes to
+     * dspark_target_hidden on dspark_exec_tier; if capture runs cross-device
+     * the kernel cannot reach across the BOUNCE peer link. Pin DSpark to the
+     * decode (home/head) tier in that case so src and dst are co-located. */
+    const bool tp_partner_dspark_ok = !e->ssd_streaming;
+    if (tp_decode && tp_partner_dspark_ok &&
+        e->gpu_cfg.n_gpus >= 2 && exec_tier < tp_half) {
         exec_tier += tp_half;
     }
-    if (tp_decode && e->gpu_cfg.n_gpus >= 2) {
+    if (tp_decode && tp_partner_dspark_ok && e->gpu_cfg.n_gpus >= 2) {
         /* Prefer the partner tier with the most free VRAM so the support
          * weights stay local to the executor. */
         uint64_t best_free = ds4_gpu_tier_free_vram(exec_tier);
@@ -56965,6 +56990,7 @@ int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
                                    need_spec_verifier,
                                    placement,
                                    e->cuda_tensor_parallel,
+                                   e->ssd_streaming,
                                    shared_prefill_workspace))
     {
         free(s);
