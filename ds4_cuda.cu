@@ -22,6 +22,13 @@
 #include <mutex>
 #include <condition_variable>
 #include <atomic>
+#include <chrono>
+
+static double cuda_now_sec(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (double)ts.tv_sec + (double)ts.tv_nsec * 1e-9;
+}
 
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
@@ -180,6 +187,9 @@ static uint32_t g_stream_expert_budget_override;
 
 struct cuda_stream_expert_cache_slot {
     int valid;
+    int claimed;        /* parallel-load marker: 1 while a worker is filling
+                         * this slot (valid=0 + claimed=1). Skipped by
+                         * lru_slot so concurrent workers don't collide. */
     const void *model_map;
     uint64_t model_size;
     uint32_t layer;
@@ -23676,11 +23686,12 @@ static int cuda_stream_expert_cache_find(
 static uint32_t cuda_stream_expert_cache_lru_slot(
         cuda_stream_expert_cache *cache) {
     for (uint32_t i = 0; i < cache->capacity; i++) {
-        if (!cache->slots[i].valid) return i;
+        if (!cache->slots[i].valid && !cache->slots[i].claimed) return i;
     }
     uint32_t slot = 0;
     uint64_t best_age = cache->slots[0].age;
     for (uint32_t i = 1; i < cache->capacity; i++) {
+        if (cache->slots[i].claimed) continue;
         if (cache->slots[i].age < best_age) {
             best_age = cache->slots[i].age;
             slot = i;
@@ -24085,9 +24096,42 @@ struct cuda_stream_load_pool {
     std::atomic<int> next_idx;
     std::atomic<int> expert_cache_disabled;
     std::atomic<int> any_failed;
+
+    /* Observability counters (read by summary printer, written by workers).
+     * All relaxed atomics. Reset by the summary printer after it snapshots. */
+    std::atomic<uint64_t> obs_layers;        /* producer calls */
+    std::atomic<uint64_t> obs_experts;       /* compact-id slots processed */
+    std::atomic<uint64_t> obs_cache_hits;    /* primary LRU hits */
+    std::atomic<uint64_t> obs_ssd_reads;     /* primary LRU misses -> SSD */
+    std::atomic<uint64_t> obs_ssd_bytes;     /* bytes read from SSD */
+    std::atomic<uint64_t> obs_lock_contention_us;  /* time spent waiting on lru_mutex */
+    std::atomic<uint64_t> obs_phase2_us;     /* SSD read wall time (per worker) */
+    std::atomic<uint64_t> obs_phase1_us;     /* cache_find/claim wall time */
 };
 
-static cuda_stream_load_pool g_load_pool = {};
+static cuda_stream_load_pool g_load_pool = {
+    /* .n_workers = */ 0,
+    /* .workers = */ {},
+    /* .init_flag = */ {},
+    /* .initialized = */ 0,
+    /* .table = */ NULL,
+    /* .expert_cache = */ NULL,
+    /* .sc = */ NULL,
+    /* .logical_tier = */ 0,
+    /* .compact_ids = */ NULL,
+    /* .lru_mutex = */ {},
+    /* .next_idx = */ {},
+    /* .expert_cache_disabled = */ {},
+    /* .any_failed = */ {},
+    /* .obs_layers = */ {},
+    /* .obs_experts = */ {},
+    /* .obs_cache_hits = */ {},
+    /* .obs_ssd_reads = */ {},
+    /* .obs_ssd_bytes = */ {},
+    /* .obs_lock_contention_us = */ {},
+    /* .obs_phase2_us = */ {},
+    /* .obs_phase1_us = */ {}
+};
 
 static int cuda_stream_load_workers_count(void) {
     int n = 4;
@@ -24127,6 +24171,7 @@ static void cuda_stream_load_worker_run(cuda_stream_load_worker *w) {
         cuda_stream_selected_cache *sc = pool->sc;
         const std::vector<int32_t> &compact_ids = *pool->compact_ids;
 
+        const int obs_enabled = getenv("DS4_CUDA_STREAMING_LOAD_PROFILE") != NULL;
         for (;;) {
             if (pool->any_failed.load()) break;
             const int i = pool->next_idx.fetch_add(1);
@@ -24139,7 +24184,11 @@ static void cuda_stream_load_worker_run(cuda_stream_load_worker *w) {
             uint32_t load_slot = 0;
             int append = 0;
             int copied_from_global_cache = 0;
+            int was_hit = 0;
+            int was_miss = 0;
+            uint64_t expert_ssd_bytes = 0;
 
+            const double p1_start = obs_enabled ? cuda_now_sec() : 0.0;
             /* Phase 1: cache find/claim under the shared LRU lock. */
             {
                 std::lock_guard<std::mutex> lock(pool->lru_mutex);
@@ -24154,18 +24203,26 @@ static void cuda_stream_load_worker_run(cuda_stream_load_worker *w) {
                     if (cache_slot >= 0) {
                         expert_cache->slots[(uint32_t)cache_slot].age =
                             ++expert_cache->tick;
+                        was_hit = 1;
                     } else {
                         load_slot = cuda_stream_expert_cache_lru_slot(expert_cache);
                         append = !expert_cache->slots[load_slot].valid;
-                        /* Mark in-use so concurrent workers don't pick it. */
+                        /* Claim the slot: mark valid=0 + claimed=1 so that
+                         * concurrent workers (calling lru_slot under the
+                         * same lock) skip it while we fill it outside the
+                         * lock in Phase 2. */
                         expert_cache->slots[load_slot].valid = 0;
+                        expert_cache->slots[load_slot].claimed = 1;
+                        was_miss = 1;
                     }
                 }
             }
+            const double p1_end = obs_enabled ? cuda_now_sec() : 0.0;
 
             /* Phase 2: SSD read OUTSIDE the LRU lock so multiple workers
              * can issue preads in parallel. Each worker uses its own
              * stage pool + upload stream. */
+            const double p2_start = obs_enabled ? cuda_now_sec() : 0.0;
             if (cache_slot < 0 && !pool->expert_cache_disabled.load() && expert_cache) {
                 int ok = cuda_stream_expert_cache_load_slot_pool(
                         expert_cache, &w->stage_pool, logical_tier,
@@ -24177,14 +24234,21 @@ static void cuda_stream_load_worker_run(cuda_stream_load_worker *w) {
                         table->gate_expert_bytes, table->down_expert_bytes);
                 if (!ok) {
                     pool->expert_cache_disabled.store(1);
+                    /* Release the claim so other workers can reuse the slot. */
+                    std::lock_guard<std::mutex> lock(pool->lru_mutex);
+                    expert_cache->slots[load_slot].claimed = 0;
                 } else {
                     std::lock_guard<std::mutex> lock(pool->lru_mutex);
                     if (append && expert_cache->count < expert_cache->capacity) {
                         expert_cache->count++;
                     }
+                    expert_cache->slots[load_slot].claimed = 0;
                     cache_slot = (int)load_slot;
+                    expert_ssd_bytes = 2ull * table->gate_expert_bytes +
+                                       table->down_expert_bytes;
                 }
             }
+            const double p2_end = obs_enabled ? cuda_now_sec() : 0.0;
 
             /* Phase 3: D2D copy from LRU to compact (small, on-device). */
             if (cache_slot >= 0 && !pool->expert_cache_disabled.load() && expert_cache) {
@@ -24228,6 +24292,26 @@ static void cuda_stream_load_worker_run(cuda_stream_load_worker *w) {
                     pool->any_failed.store(1);
                     break;
                 }
+                expert_ssd_bytes = 2ull * table->gate_expert_bytes +
+                                   table->down_expert_bytes;
+            }
+
+            if (obs_enabled) {
+                pool->obs_experts.fetch_add(1, std::memory_order_relaxed);
+                if (was_hit) {
+                    pool->obs_cache_hits.fetch_add(1, std::memory_order_relaxed);
+                }
+                if (was_miss) {
+                    pool->obs_ssd_reads.fetch_add(1, std::memory_order_relaxed);
+                }
+                if (expert_ssd_bytes) {
+                    pool->obs_ssd_bytes.fetch_add(expert_ssd_bytes,
+                                                  std::memory_order_relaxed);
+                }
+                pool->obs_phase1_us.fetch_add((uint64_t)((p1_end - p1_start) * 1000000.0),
+                                              std::memory_order_relaxed);
+                pool->obs_phase2_us.fetch_add((uint64_t)((p2_end - p2_start) * 1000000.0),
+                                              std::memory_order_relaxed);
             }
         }
 
@@ -24326,6 +24410,39 @@ static int cuda_stream_selected_cache_begin_load_parallel(
     if (getenv("DS4_CUDA_STREAMING_LOAD_DEBUG")) {
         fprintf(stderr, "ds4[load-pool] all workers returned failed=%d\n",
                 g_load_pool.any_failed.load());
+    }
+
+    /* Periodic observability summary. */
+    if (getenv("DS4_CUDA_STREAMING_LOAD_PROFILE")) {
+        g_load_pool.obs_layers.fetch_add(1, std::memory_order_relaxed);
+        const uint64_t layers = g_load_pool.obs_layers.load(std::memory_order_relaxed);
+        const uint64_t period = []() {
+            const char *e = getenv("DS4_CUDA_STREAMING_LOAD_PROFILE_EVERY");
+            if (e && e[0]) {
+                unsigned long v = strtoul(e, NULL, 10);
+                if (v > 0) return (uint64_t)v;
+            }
+            return (uint64_t)100;
+        }();
+        if (layers % period == 0) {
+            const uint64_t experts = g_load_pool.obs_experts.load();
+            const uint64_t hits    = g_load_pool.obs_cache_hits.load();
+            const uint64_t misses  = g_load_pool.obs_ssd_reads.load();
+            const uint64_t bytes   = g_load_pool.obs_ssd_bytes.load();
+            const uint64_t p1_us   = g_load_pool.obs_phase1_us.load();
+            const uint64_t p2_us   = g_load_pool.obs_phase2_us.load();
+            const double hit_rate  = experts ? 100.0 * (double)hits / (double)experts : 0.0;
+            const double gb        = (double)bytes / 1073741824.0;
+            fprintf(stderr,
+                    "ds4[load-pool] summary layers=%lu experts=%lu hit_rate=%.1f%% "
+                    "ssd_reads=%lu ssd_gb=%.2f phase1_us/expert=%.1f phase2_us/expert=%.1f "
+                    "workers=%d\n",
+                    (unsigned long)layers, (unsigned long)experts, hit_rate,
+                    (unsigned long)misses, gb,
+                    experts ? (double)p1_us / (double)experts : 0.0,
+                    experts ? (double)p2_us / (double)experts : 0.0,
+                    g_load_pool.n_workers);
+        }
     }
 
     if (g_load_pool.any_failed.load()) {
