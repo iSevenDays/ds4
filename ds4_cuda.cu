@@ -253,9 +253,18 @@ struct cuda_stream_expert_cache {
     uint64_t tick;
     uint64_t gate_expert_bytes;
     uint64_t down_expert_bytes;
-    char *gate_ptr;
-    char *up_ptr;
-    char *down_ptr;
+    /* Chunked slab storage. Post P2P-driver / ReBAR BIOS changes VRAM fragments
+     * badly after the resident weights + scratch + KV are placed, so a single
+     * cudaMalloc(cap * expert_bytes) fails even though the same total bytes are
+     * free in smaller holes. Each slab is therefore a vector of ~512 MiB chunks
+     * allocated independently; slot s lives at
+     *   chunks[s / experts_per_chunk] + (s % experts_per_chunk) * expert_bytes
+     * The LRU logic (eviction / hit / miss) is unchanged — only storage layout
+     * moves from one contiguous slab to many small ones. */
+    std::vector<char *> gate_chunks;
+    std::vector<char *> up_chunks;
+    std::vector<char *> down_chunks;
+    uint32_t experts_per_chunk;
     uint64_t gate_capacity;
     uint64_t up_capacity;
     uint64_t down_capacity;
@@ -1932,17 +1941,25 @@ static void cuda_stream_selected_cache_release(void) {
 
 static void cuda_stream_expert_cache_release_all(void) {
     ds4_ssd_ctx *ssd = ssd_current();
-    if (ssd->expert_cache.gate_ptr) {
-        (void)cudaFree(ssd->expert_cache.gate_ptr);
-    }
-    if (ssd->expert_cache.up_ptr) {
-        (void)cudaFree(ssd->expert_cache.up_ptr);
-    }
-    if (ssd->expert_cache.down_ptr) {
-        (void)cudaFree(ssd->expert_cache.down_ptr);
-    }
+    for (char *p : ssd->expert_cache.gate_chunks) { if (p) (void)cudaFree(p); }
+    for (char *p : ssd->expert_cache.up_chunks)   { if (p) (void)cudaFree(p); }
+    for (char *p : ssd->expert_cache.down_chunks) { if (p) (void)cudaFree(p); }
+    ssd->expert_cache.gate_chunks.clear();
+    ssd->expert_cache.up_chunks.clear();
+    ssd->expert_cache.down_chunks.clear();
     ssd->expert_cache.slots.clear();
-    memset(&ssd->expert_cache, 0, sizeof(ssd->expert_cache));
+    /* Reset scalars in place (do NOT memset the struct — it now owns
+     * std::vector members whose in-object state must stay valid). */
+    ssd->expert_cache.valid = 0;
+    ssd->expert_cache.capacity = 0;
+    ssd->expert_cache.count = 0;
+    ssd->expert_cache.tick = 0;
+    ssd->expert_cache.gate_expert_bytes = 0;
+    ssd->expert_cache.down_expert_bytes = 0;
+    ssd->expert_cache.experts_per_chunk = 0;
+    ssd->expert_cache.gate_capacity = 0;
+    ssd->expert_cache.up_capacity = 0;
+    ssd->expert_cache.down_capacity = 0;
 }
 
 static void cuda_stream_expert_cache_invalidate(void) {
@@ -2109,12 +2126,6 @@ static void cuda_stream_expert_cache_note_size(
     ssd->memory_cap_notice = 0;
 }
 
-static uint32_t cuda_stream_expert_cache_shrunken_cap(uint32_t cap) {
-    if (cap == 0) return 0;
-    const uint32_t release = (cap + 9u) / 10u;
-    return cap > release ? cap - release : 0;
-}
-
 static void cuda_stream_expert_cache_note_oom_cap(
         uint32_t failed_cap,
         uint32_t new_cap,
@@ -2153,48 +2164,127 @@ static void cuda_stream_expert_cache_note_oom_cap(
     }
 }
 
-static int cuda_stream_expert_cache_try_alloc(
+/* Target size of each expert-slab chunk. Fragmented VRAM (post P2P-driver /
+ * ReBAR changes) cannot satisfy one giant contiguous cudaMalloc, but many small
+ * ones fit the holes. Tunable via DS4_CUDA_STREAMING_EXPERT_CHUNK_MIB. */
+#define DS4_CUDA_EXPERT_SLAB_CHUNK_MIB_DEFAULT 512u
+
+static uint64_t cuda_stream_expert_cache_chunk_bytes(void) {
+    uint64_t mib = DS4_CUDA_EXPERT_SLAB_CHUNK_MIB_DEFAULT;
+    const char *env = getenv("DS4_CUDA_STREAMING_EXPERT_CHUNK_MIB");
+    if (env && env[0]) {
+        char *end = NULL;
+        errno = 0;
+        unsigned long long v = strtoull(env, &end, 10);
+        while (end && (*end == ' ' || *end == '\t')) end++;
+        if (end != env && errno == 0 && end && *end == '\0' && v >= 1) {
+            mib = (uint64_t)v;
+        }
+    }
+    if (mib > 4096ull) mib = 4096ull;        /* hard upper sanity bound */
+    return mib * 1048576ull;
+}
+
+/* Resolve the device address of slot `slot` within a chunked slab. */
+static inline char *cuda_stream_expert_cache_slot_ptr(
+        const std::vector<char *> &chunks,
+        uint32_t experts_per_chunk,
+        uint32_t slot,
+        uint64_t expert_bytes) {
+    const uint32_t chunk_idx = slot / experts_per_chunk;
+    const uint32_t in_chunk = slot % experts_per_chunk;
+    return chunks[chunk_idx] + (uint64_t)in_chunk * expert_bytes;
+}
+
+/* Allocate the three resident expert-cache slabs as many small (~chunk_bytes)
+ * chunks instead of one giant contiguous cudaMalloc each. Each slab is filled
+ * chunk-by-chunk; on the first chunk that fails we stop and keep whatever was
+ * already placed — a partial fill beats the old shrink-the-whole-slab cascade.
+ *
+ * Returns the number of experts actually allocated (chunk_count *
+ * experts_per_chunk). On total failure returns 0 and clears the vectors.
+ * *out_experts_per_chunk receives the slot grouping used. */
+static uint32_t cuda_stream_expert_cache_try_alloc(
         uint32_t cap,
         uint64_t gate_expert_bytes,
         uint64_t down_expert_bytes,
-        char **gate_ptr,
-        char **up_ptr,
-        char **down_ptr,
+        uint32_t *out_experts_per_chunk,
+        std::vector<char *> &gate_chunks,
+        std::vector<char *> &up_chunks,
+        std::vector<char *> &down_chunks,
         const char **errstr) {
-    *gate_ptr = NULL;
-    *up_ptr = NULL;
-    *down_ptr = NULL;
+    if (out_experts_per_chunk) *out_experts_per_chunk = 0;
     if (errstr) *errstr = NULL;
+    gate_chunks.clear();
+    up_chunks.clear();
+    down_chunks.clear();
     if (cap == 0 ||
+        gate_expert_bytes == 0 || down_expert_bytes == 0 ||
         (uint64_t)cap > UINT64_MAX / gate_expert_bytes ||
         (uint64_t)cap > UINT64_MAX / down_expert_bytes) {
         return 0;
     }
-    const uint64_t gate_bytes = (uint64_t)cap * gate_expert_bytes;
-    const uint64_t down_bytes = (uint64_t)cap * down_expert_bytes;
 
-    void *gate = NULL;
-    void *up = NULL;
-    void *down = NULL;
-    cudaError_t err = cudaMalloc(&gate, (size_t)gate_bytes);
-    if (err != cudaSuccess) goto fail;
-    err = cudaMalloc(&up, (size_t)gate_bytes);
-    if (err != cudaSuccess) goto fail;
-    err = cudaMalloc(&down, (size_t)down_bytes);
-    if (err != cudaSuccess) goto fail;
+    /* Pick one experts_per_chunk derived from the LARGER slab so that every
+     * chunk of gate/up/down stays under the chunk budget. All three slabs share
+     * the same grouping so a slot maps to the same chunk index in each. */
+    const uint64_t bigger = gate_expert_bytes > down_expert_bytes
+                              ? gate_expert_bytes : down_expert_bytes;
+    const uint64_t chunk_budget = cuda_stream_expert_cache_chunk_bytes();
+    uint64_t epc = chunk_budget / bigger;
+    if (epc == 0) epc = 1;
+    if (epc > cap) epc = cap;
+    if (epc > 0xFFFFFFFFull) epc = 0xFFFFFFFFull;
+    const uint32_t experts_per_chunk = (uint32_t)epc;
+    const uint64_t gate_chunk_bytes =
+        (uint64_t)experts_per_chunk * gate_expert_bytes;
+    const uint64_t down_chunk_bytes =
+        (uint64_t)experts_per_chunk * down_expert_bytes;
+    const uint32_t chunks_needed =
+        (cap + experts_per_chunk - 1u) / experts_per_chunk;
 
-    *gate_ptr = (char *)gate;
-    *up_ptr = (char *)up;
-    *down_ptr = (char *)down;
-    return 1;
+    gate_chunks.reserve(chunks_needed);
+    up_chunks.reserve(chunks_needed);
+    down_chunks.reserve(chunks_needed);
 
-fail:
-    if (errstr) *errstr = cudaGetErrorString(err);
-    (void)cudaGetLastError();
-    if (gate) (void)cudaFree(gate);
-    if (up) (void)cudaFree(up);
-    if (down) (void)cudaFree(down);
-    return 0;
+    for (uint32_t c = 0; c < chunks_needed; c++) {
+        void *gate = NULL;
+        void *up = NULL;
+        void *down = NULL;
+        cudaError_t err = cudaMalloc(&gate, (size_t)gate_chunk_bytes);
+        if (err != cudaSuccess) {
+            if (errstr) *errstr = cudaGetErrorString(err);
+            (void)cudaGetLastError();
+            break;
+        }
+        err = cudaMalloc(&up, (size_t)gate_chunk_bytes);
+        if (err != cudaSuccess) {
+            if (errstr) *errstr = cudaGetErrorString(err);
+            (void)cudaGetLastError();
+            (void)cudaFree(gate);
+            break;
+        }
+        err = cudaMalloc(&down, (size_t)down_chunk_bytes);
+        if (err != cudaSuccess) {
+            if (errstr) *errstr = cudaGetErrorString(err);
+            (void)cudaGetLastError();
+            (void)cudaFree(gate);
+            (void)cudaFree(up);
+            break;
+        }
+        gate_chunks.push_back((char *)gate);
+        up_chunks.push_back((char *)up);
+        down_chunks.push_back((char *)down);
+    }
+
+    if (out_experts_per_chunk) *out_experts_per_chunk = experts_per_chunk;
+    const uint32_t got =
+        (uint32_t)gate_chunks.size() * experts_per_chunk;
+    if (gate_chunks.empty()) {
+        /* nothing allocated at all; vectors are already empty */
+        return 0;
+    }
+    return got;
 }
 
 static void cuda_stream_selected_stage_release(void) {
@@ -2381,67 +2471,82 @@ static cuda_stream_expert_cache *cuda_stream_expert_cache_prepare(
 
     cuda_stream_expert_cache_release_all();
     ec = &ssd_current()->expert_cache;
-    while (cap != 0) {
-        if ((uint64_t)cap > UINT64_MAX / gate_expert_bytes ||
-            (uint64_t)cap > UINT64_MAX / down_expert_bytes) {
-            fprintf(stderr, "ds4: CUDA streaming expert cache size overflow\n");
+    if ((uint64_t)cap > UINT64_MAX / gate_expert_bytes ||
+        (uint64_t)cap > UINT64_MAX / down_expert_bytes) {
+        fprintf(stderr, "ds4: CUDA streaming expert cache size overflow\n");
+        return NULL;
+    }
+
+    {
+        uint32_t experts_per_chunk = 0;
+        std::vector<char *> gate_chunks;
+        std::vector<char *> up_chunks;
+        std::vector<char *> down_chunks;
+        const char *alloc_error = NULL;
+        const uint32_t got_cap = cuda_stream_expert_cache_try_alloc(
+                cap,
+                gate_expert_bytes,
+                down_expert_bytes,
+                &experts_per_chunk,
+                gate_chunks,
+                up_chunks,
+                down_chunks,
+                &alloc_error);
+
+        if (got_cap == 0 || gate_chunks.empty()) {
+            cuda_stream_expert_cache_note_oom_cap(cap,
+                                                  0,
+                                                  expert_bytes,
+                                                  alloc_error);
+            for (char *p : gate_chunks) { if (p) (void)cudaFree(p); }
+            for (char *p : up_chunks)   { if (p) (void)cudaFree(p); }
+            for (char *p : down_chunks) { if (p) (void)cudaFree(p); }
             return NULL;
         }
 
-        char *gate_ptr = NULL;
-        char *up_ptr = NULL;
-        char *down_ptr = NULL;
-        const char *alloc_error = NULL;
-        if (!cuda_stream_expert_cache_try_alloc(cap,
-                                                gate_expert_bytes,
-                                                down_expert_bytes,
-                                                &gate_ptr,
-                                                &up_ptr,
-                                                &down_ptr,
-                                                &alloc_error)) {
-            const uint32_t new_cap =
-                cuda_stream_expert_cache_shrunken_cap(cap);
-            cuda_stream_expert_cache_note_oom_cap(cap,
-                                                  new_cap,
-                                                  expert_bytes,
-                                                  alloc_error);
-            cap = new_cap;
-            if (cap != 0) {
-                cap = cuda_stream_expert_cache_live_budget(cap,
-                                                           gate_expert_bytes,
-                                                           down_expert_bytes,
-                                                           0,
-                                                           1);
+        if (got_cap < cap) {
+            /* Partial fill: some chunks would not fit the fragmented holes.
+             * Proceed with what we got — better than disabling the cache. */
+            cuda_model_load_progress_finish();
+            fprintf(stderr,
+                    "ds4: CUDA streaming expert cache chunked alloc placed "
+                    "%u/%u experts (%zu chunks x %u experts, %.1f MiB/chunk)%s%s\n",
+                    got_cap, cap, gate_chunks.size(), experts_per_chunk,
+                    (double)((uint64_t)experts_per_chunk *
+                             (gate_expert_bytes > down_expert_bytes
+                                  ? gate_expert_bytes : down_expert_bytes))
+                        / 1048576.0,
+                    alloc_error && alloc_error[0] ? ": " : "",
+                    alloc_error && alloc_error[0] ? alloc_error : "");
+            ds4_ssd_ctx *ssd = ssd_current();
+            if (ssd->runtime_cap == 0 || ssd->runtime_cap > got_cap) {
+                ssd->runtime_cap = got_cap;
             }
-            continue;
         }
 
         try {
-            ec->slots.resize(cap);
+            ec->slots.resize(got_cap);
         } catch (...) {
             fprintf(stderr, "ds4: CUDA streaming expert cache metadata allocation failed\n");
-            (void)cudaFree(gate_ptr);
-            (void)cudaFree(up_ptr);
-            (void)cudaFree(down_ptr);
-            cuda_stream_expert_cache_release_all();
+            for (char *p : gate_chunks) { if (p) (void)cudaFree(p); }
+            for (char *p : up_chunks)   { if (p) (void)cudaFree(p); }
+            for (char *p : down_chunks) { if (p) (void)cudaFree(p); }
             return NULL;
         }
 
         ec->valid = 1;
-        ec->capacity = cap;
+        ec->capacity = got_cap;
         ec->count = 0;
         ec->tick = 0;
         ec->gate_expert_bytes = gate_expert_bytes;
         ec->down_expert_bytes = down_expert_bytes;
-        ec->gate_ptr = gate_ptr;
-        ec->up_ptr = up_ptr;
-        ec->down_ptr = down_ptr;
-        ec->gate_capacity =
-            (uint64_t)cap * gate_expert_bytes;
-        ec->up_capacity =
-            (uint64_t)cap * gate_expert_bytes;
-        ec->down_capacity =
-            (uint64_t)cap * down_expert_bytes;
+        ec->experts_per_chunk = experts_per_chunk;
+        ec->gate_chunks = std::move(gate_chunks);
+        ec->up_chunks = std::move(up_chunks);
+        ec->down_chunks = std::move(down_chunks);
+        ec->gate_capacity = (uint64_t)got_cap * gate_expert_bytes;
+        ec->up_capacity   = (uint64_t)got_cap * gate_expert_bytes;
+        ec->down_capacity = (uint64_t)got_cap * down_expert_bytes;
         return ec;
     }
     return NULL;
@@ -2502,22 +2607,29 @@ static int cuda_stream_expert_cache_copy_to_compact(
         char *compact_gate,
         char *compact_up,
         char *compact_down) {
-    const uint64_t gate_src = (uint64_t)cache_slot * cache->gate_expert_bytes;
-    const uint64_t down_src = (uint64_t)cache_slot * cache->down_expert_bytes;
     const uint64_t gate_dst = (uint64_t)compact_slot * cache->gate_expert_bytes;
     const uint64_t down_dst = (uint64_t)compact_slot * cache->down_expert_bytes;
+    char *src_gate = cuda_stream_expert_cache_slot_ptr(
+            cache->gate_chunks, cache->experts_per_chunk,
+            cache_slot, cache->gate_expert_bytes);
+    char *src_up = cuda_stream_expert_cache_slot_ptr(
+            cache->up_chunks, cache->experts_per_chunk,
+            cache_slot, cache->gate_expert_bytes);
+    char *src_down = cuda_stream_expert_cache_slot_ptr(
+            cache->down_chunks, cache->experts_per_chunk,
+            cache_slot, cache->down_expert_bytes);
     return cuda_ok(cudaMemcpy(compact_gate + gate_dst,
-                              cache->gate_ptr + gate_src,
+                              src_gate,
                               (size_t)cache->gate_expert_bytes,
                               cudaMemcpyDeviceToDevice),
                    "streaming selected gate cache copy") &&
            cuda_ok(cudaMemcpy(compact_up + gate_dst,
-                              cache->up_ptr + gate_src,
+                              src_up,
                               (size_t)cache->gate_expert_bytes,
                               cudaMemcpyDeviceToDevice),
                    "streaming selected up cache copy") &&
            cuda_ok(cudaMemcpy(compact_down + down_dst,
-                              cache->down_ptr + down_src,
+                              src_down,
                               (size_t)cache->down_expert_bytes,
                               cudaMemcpyDeviceToDevice),
                    "streaming selected down cache copy");
@@ -2542,21 +2654,28 @@ static int cuda_stream_expert_cache_load_slot(
         up_offset + (uint64_t)expert * gate_expert_bytes;
     const uint64_t down_src =
         down_offset + (uint64_t)expert * down_expert_bytes;
-    const uint64_t gate_dst = (uint64_t)slot * gate_expert_bytes;
-    const uint64_t down_dst = (uint64_t)slot * down_expert_bytes;
-    if (!cuda_model_copy_to_device_streamed(cache->gate_ptr + gate_dst,
+    char *dst_gate = cuda_stream_expert_cache_slot_ptr(
+            cache->gate_chunks, cache->experts_per_chunk,
+            slot, gate_expert_bytes);
+    char *dst_up = cuda_stream_expert_cache_slot_ptr(
+            cache->up_chunks, cache->experts_per_chunk,
+            slot, gate_expert_bytes);
+    char *dst_down = cuda_stream_expert_cache_slot_ptr(
+            cache->down_chunks, cache->experts_per_chunk,
+            slot, down_expert_bytes);
+    if (!cuda_model_copy_to_device_streamed(dst_gate,
                                             model_map,
                                             model_size,
                                             gate_src,
                                             gate_expert_bytes,
                                             "cached moe_gate") ||
-        !cuda_model_copy_to_device_streamed(cache->up_ptr + gate_dst,
+        !cuda_model_copy_to_device_streamed(dst_up,
                                             model_map,
                                             model_size,
                                             up_src,
                                             gate_expert_bytes,
                                             "cached moe_up") ||
-        !cuda_model_copy_to_device_streamed(cache->down_ptr + down_dst,
+        !cuda_model_copy_to_device_streamed(dst_down,
                                             model_map,
                                             model_size,
                                             down_src,
