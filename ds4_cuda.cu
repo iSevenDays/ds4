@@ -388,6 +388,54 @@ static int ds4_ssd_debug_on(void) {
     return e;
 }
 
+/* VRAM allocation tracing (DS4_VRAM_TRACE=1). Lightweight observability hook
+ * used to diagnose patterns that fragment or consume VRAM invisibly (e.g.
+ * expert-cache OOM with multi-GB free, scratch alloc failing at 384 MiB).
+ *
+ * Zero overhead when DS4_VRAM_TRACE is unset: the only cost is a single
+ * getenv() lookup, memoized on first call. When enabled, each call performs
+ * one cudaMemGetInfo (~microseconds) on the requested device, regardless of
+ * the ambient device, then restores the ambient device.
+ *
+ * `dev` is the physical CUDA device index to query; pass -1 to query the
+ * ambient device without a set/restore pair. */
+static void ds4_trace_vram(const char *where, int dev) {
+    static int enabled = -1;
+    if (enabled < 0) {
+        const char *s = getenv("DS4_VRAM_TRACE");
+        enabled = (s && s[0] == '1') ? 1 : 0;
+    }
+    if (!enabled) return;
+
+    int saved = -1;
+    if (dev >= 0) {
+        (void)cudaGetDevice(&saved);
+        if (cudaSetDevice(dev) != cudaSuccess) {
+            (void)cudaGetLastError();
+            if (saved >= 0) (void)cudaSetDevice(saved);
+            return;
+        }
+    } else {
+        (void)cudaGetDevice(&dev); /* report ambient device index */
+    }
+
+    size_t free_b = 0, total_b = 0;
+    if (cudaMemGetInfo(&free_b, &total_b) == cudaSuccess) {
+        fprintf(stderr,
+                "ds4[vram] %-44s dev=%d free=%.2f GiB used=%.2f GiB\n",
+                where, dev,
+                (double)free_b  / 1073741824.0,
+                (double)(total_b - free_b) / 1073741824.0);
+    } else {
+        (void)cudaGetLastError();
+        fprintf(stderr, "ds4[vram] %-44s dev=%d cudaMemGetInfo failed\n",
+                where, dev);
+    }
+    fflush(stderr);
+
+    if (saved >= 0) (void)cudaSetDevice(saved);
+}
+
 extern "C" int ds4_gpu_debug_probe(const char *where, int il, int tier) {
     /* Resolve the ambient device even when the probe is off so the call still
      * has a well-defined side-effect-free return; the work happens inside the
@@ -2239,6 +2287,14 @@ extern "C" int ds4_gpu_init_multi(const ds4_gpu_config *cfg) {
     cuda_decode_dispatch_env_refresh();
     g_current_logical_tier = -1;
 
+    /* VRAM trace: baseline free/used per device before any allocation.
+     * The per-device loop below lazily publishes g_n_gpus, so query each
+     * physical device directly from cfg. */
+    for (int i = 0; i < cfg->n_gpus; i++) {
+        ds4_trace_vram("init_multi entry (baseline)",
+                       cfg->device_indices[i]);
+    }
+
     /* g_n_gpus is published incrementally so ds4_gpu_cleanup() can unwind
      * partial state on failure. We publish `i + 1` BEFORE allocating any
      * resources for context `i`, so even if (e.g.) stream creation
@@ -2283,6 +2339,15 @@ extern "C" int ds4_gpu_init_multi(const ds4_gpu_config *cfg) {
         c->used_bytes   = 0;
         c->scratch      = NULL;
         c->scratch_bytes = 0;
+    }
+
+    /* VRAM trace: after per-device setup (context, stream, event, cublas).
+     * cuBLAS handle creation and the first cudaSetDevice on each device
+     * normally trigger lazy driver/context allocation; this measures how
+     * much VRAM that consumed. */
+    for (int i = 0; i < g_n_gpus; i++) {
+        ds4_trace_vram("init_multi after per-device setup",
+                       g_gpu[i].device_id);
     }
 
     /* NxN peer-access matrix.
@@ -2418,6 +2483,14 @@ extern "C" int ds4_gpu_init_multi(const ds4_gpu_config *cfg) {
                     failed_bytes, failed_iter);
             }
         }
+    }
+
+    /* VRAM trace: after peer-access validation. The probe buffers were
+     * freed before this point, but enabling peer access can reserve
+     * per-pair driver state; capture the post-validation baseline. */
+    for (int i = 0; i < g_n_gpus; i++) {
+        ds4_trace_vram("init_multi after peer-access validation",
+                       g_gpu[i].device_id);
     }
 
     g_cublas_ready = 1;
@@ -3660,6 +3733,10 @@ extern "C" int ds4_gpu_device_cache_tensors(int device_id,
         if (prev_device >= 0) (void)cudaSetDevice(prev_device);
         return 5;
     }
+    /* VRAM trace: selective weight-cache slab just landed on this device.
+     * Reports how much VRAM the cache slab (+ any prior growth) consumed. */
+    ds4_trace_vram("device_cache_tensors after slab cudaMalloc",
+                   device_id);
     if (c.present && c.bytes > 0) {
         cudaError_t e = cudaMemcpy(new_base, c.base, c.bytes,
                                    cudaMemcpyDeviceToDevice);
@@ -16194,6 +16271,16 @@ extern "C" int ds4_gpu_attention_output_q8_batch_tensor(
         const uint64_t heads_h_bytes = heads_h_count * sizeof(__half);
         const uint64_t low_tmp_offset = (heads_h_bytes + 255u) & ~255ull;
         const uint64_t tmp_bytes = low_tmp_offset + low_tmp_count * sizeof(float);
+        {
+            char wb[128];
+            int phys = (logical_tier >= 0 && logical_tier < g_n_gpus)
+                       ? g_gpu[logical_tier].device_id : -1;
+            snprintf(wb, sizeof(wb),
+                     "scratch cuda_tmp_alloc_on want=%.2f MiB tier=%d (%s)",
+                     (double)tmp_bytes / (1024.0 * 1024.0),
+                     logical_tier, "attention output a cublas");
+            ds4_trace_vram(wb, phys);
+        }
         void *tmp = cuda_tmp_alloc_on(logical_tier, tmp_bytes, "attention output a cublas");
         if (!tmp) return 0;
         __half *heads_h = (__half *)tmp;
@@ -23936,12 +24023,36 @@ static int cuda_stream_expert_cache_try_alloc(
     void *gate = NULL;
     void *up = NULL;
     void *down = NULL;
+    {
+        char wb[112];
+        snprintf(wb, sizeof(wb),
+                 "expert_cache cudaMalloc gate cap=%u want=%.2f MiB",
+                 cap, (double)gate_bytes / (1024.0 * 1024.0));
+        ds4_trace_vram(wb, -1);
+    }
     cudaError_t err = cudaMalloc(&gate, (size_t)gate_bytes);
     if (err != cudaSuccess) goto fail;
+    ds4_trace_vram("expert_cache cudaMalloc gate OK", -1);
+    {
+        char wb[112];
+        snprintf(wb, sizeof(wb),
+                 "expert_cache cudaMalloc up   cap=%u want=%.2f MiB",
+                 cap, (double)gate_bytes / (1024.0 * 1024.0));
+        ds4_trace_vram(wb, -1);
+    }
     err = cudaMalloc(&up, (size_t)gate_bytes);
     if (err != cudaSuccess) goto fail;
+    ds4_trace_vram("expert_cache cudaMalloc up OK", -1);
+    {
+        char wb[112];
+        snprintf(wb, sizeof(wb),
+                 "expert_cache cudaMalloc down cap=%u want=%.2f MiB",
+                 cap, (double)down_bytes / (1024.0 * 1024.0));
+        ds4_trace_vram(wb, -1);
+    }
     err = cudaMalloc(&down, (size_t)down_bytes);
     if (err != cudaSuccess) goto fail;
+    ds4_trace_vram("expert_cache cudaMalloc down OK", -1);
 
     *gate_ptr = (char *)gate;
     *up_ptr = (char *)up;
@@ -24019,6 +24130,15 @@ static cuda_stream_expert_cache *cuda_stream_expert_cache_prepare(
         char *up_ptr = NULL;
         char *down_ptr = NULL;
         const char *alloc_error = NULL;
+        /* VRAM trace: immediately before the expert-LRU slab try_alloc.
+         * `cap` is the number of experts we are about to ask for; the
+         * ambient device is already ssd_current()'s physical device. */
+        {
+            char where_buf[96];
+            snprintf(where_buf, sizeof(where_buf),
+                     "expert_cache before try_alloc cap=%u experts", cap);
+            ds4_trace_vram(where_buf, -1);
+        }
         if (!cuda_stream_expert_cache_try_alloc(cap,
                                                 gate_expert_bytes,
                                                 down_expert_bytes,
@@ -24026,6 +24146,9 @@ static cuda_stream_expert_cache *cuda_stream_expert_cache_prepare(
                                                 &up_ptr,
                                                 &down_ptr,
                                                 &alloc_error)) {
+            /* VRAM trace: try_alloc failed. Show remaining free VRAM so
+             * the operator can see exactly how short the budget was. */
+            ds4_trace_vram("expert_cache try_alloc FAILED", -1);
             const uint32_t new_cap =
                 cuda_stream_expert_cache_shrunken_cap(cap);
             cuda_stream_expert_cache_note_oom_cap(cap,
@@ -24042,6 +24165,9 @@ static cuda_stream_expert_cache *cuda_stream_expert_cache_prepare(
             }
             continue;
         }
+        /* VRAM trace: try_alloc succeeded. The slabs (gate+up+down) are
+         * now live; report the post-alloc free pool on this device. */
+        ds4_trace_vram("expert_cache try_alloc OK", -1);
 
         try {
             ec->slots.resize(cap);
