@@ -236,57 +236,6 @@ static ds4_ssd_ctx g_ssd[DS4_MAX_GPUS];
 /* Forward declaration: body is defined after g_gpu[] / g_n_gpus below. */
 static ds4_ssd_ctx *ssd_current(void);
 
-/* Resident SSD-streaming expert cache: keeps hot routed experts in VRAM so a
- * decode step turns most selected-expert loads into device-to-device copies
- * instead of host uploads. Caches are kept per (gate,down) byte-size class:
- * mixed-quant models (e.g. q2-q4-imatrix GGUFs) interleave layers whose
- * routed experts have different byte sizes, and a single cache keyed on the
- * last-seen size would be released and rebuilt on every layer-size
- * transition, never accumulating hits. */
-enum {
-    DS4_CUDA_STREAM_EXPERT_DEFAULT = 8u * 64u,
-    DS4_CUDA_STREAM_EXPERT_MAX = 61u * 384u
-};
-#define DS4_CUDA_STREAM_EXPERT_CLASSES 4
-
-struct cuda_stream_expert_cache_slot {
-    int valid;
-    const void *model_map;
-    uint64_t model_size;
-    uint32_t layer;
-    uint32_t n_total_expert;
-    uint32_t expert;
-    uint64_t gate_offset;
-    uint64_t up_offset;
-    uint64_t down_offset;
-    uint64_t gate_expert_bytes;
-    uint64_t down_expert_bytes;
-    uint64_t age;
-};
-
-struct cuda_stream_expert_cache {
-    int valid;
-    uint32_t capacity;
-    uint32_t count;
-    uint64_t tick;
-    uint64_t gate_expert_bytes;
-    uint64_t down_expert_bytes;
-    char *gate_ptr;
-    char *up_ptr;
-    char *down_ptr;
-    uint64_t gate_capacity;
-    uint64_t up_capacity;
-    uint64_t down_capacity;
-    std::vector<cuda_stream_expert_cache_slot> slots;
-};
-
-static cuda_stream_expert_cache g_stream_expert_caches[DS4_CUDA_STREAM_EXPERT_CLASSES];
-static uint32_t g_stream_expert_budget_override;
-static uint32_t g_stream_expert_runtime_caps[DS4_CUDA_STREAM_EXPERT_CLASSES];
-static uint32_t g_stream_expert_memory_cap_notices[DS4_CUDA_STREAM_EXPERT_CLASSES];
-static uint64_t g_stream_expert_class_gate_bytes[DS4_CUDA_STREAM_EXPERT_CLASSES];
-static uint64_t g_stream_expert_class_down_bytes[DS4_CUDA_STREAM_EXPERT_CLASSES];
-
 static void cuda_stream_selected_cache_invalidate(void) {
     ssd_current()->selected_cache.valid = 0;
 }
@@ -23693,7 +23642,45 @@ static int cuda_stream_selected_ranges_valid(
            down_bytes <= table->model_size - table->down_offset;
 }
 
-<<<<<<< HEAD
+/* Range validation for callers that work with raw layer parameters instead of
+ * the ds4_gpu_stream_expert_table struct (e.g. the hotlist seed entry point,
+ * which receives its arguments unpacked). Pure bounds check, no state. */
+static int cuda_stream_layer_expert_ranges_valid(
+        uint64_t model_size,
+        uint32_t n_total_expert,
+        uint64_t gate_offset,
+        uint64_t up_offset,
+        uint64_t down_offset,
+        uint64_t gate_expert_bytes,
+        uint64_t down_expert_bytes,
+        const char *what) {
+    if (n_total_expert == 0 ||
+        gate_expert_bytes == 0 ||
+        down_expert_bytes == 0 ||
+        (uint64_t)n_total_expert > UINT64_MAX / gate_expert_bytes ||
+        (uint64_t)n_total_expert > UINT64_MAX / down_expert_bytes) {
+        fprintf(stderr,
+                "ds4: CUDA streaming %s expert size overflow\n",
+                what ? what : "selected");
+        return 0;
+    }
+    const uint64_t full_gate_bytes =
+        (uint64_t)n_total_expert * gate_expert_bytes;
+    const uint64_t full_down_bytes =
+        (uint64_t)n_total_expert * down_expert_bytes;
+    if (gate_offset > model_size || up_offset > model_size ||
+        down_offset > model_size ||
+        full_gate_bytes > model_size - gate_offset ||
+        full_gate_bytes > model_size - up_offset ||
+        full_down_bytes > model_size - down_offset) {
+        fprintf(stderr,
+                "ds4: CUDA streaming %s expert range outside model map\n",
+                what ? what : "selected");
+        return 0;
+    }
+    return 1;
+}
+
 /* =========================================================================
  * Resident LRU expert cache (port from feat/mgpu-ssd).
  *
@@ -23702,12 +23689,6 @@ static int cuda_stream_selected_ranges_valid(
  * cudaSetDevice()'d). The slab is sized lazily by cuda_stream_expert_cache_prepare
  * using cudaMemGetInfo() on the current device minus the configured reserve.
  * ========================================================================= */
-
-/* No-op stub for the progress meter that exists in the mgpu-ssd build but
- * not in antirez main. Keeping the call sites identical lets us backport
- * the LRU logging verbatim. */
-static void cuda_model_load_progress_finish(void) {
-}
 
 static void cuda_stream_expert_cache_release_all(void) {
     ds4_ssd_ctx *ssd = ssd_current();
@@ -23732,54 +23713,6 @@ static void cuda_stream_expert_cache_invalidate(void) {
     ssd->expert_cache.valid = 0;
     ssd->expert_cache.count = 0;
     ssd->expert_cache.tick = 0;
-=======
-static void cuda_stream_expert_cache_release_class(int class_idx) {
-    cuda_stream_expert_cache *cache = &g_stream_expert_caches[class_idx];
-    if (cache->gate_ptr) {
-        (void)cudaFree(cache->gate_ptr);
-    }
-    if (cache->up_ptr) {
-        (void)cudaFree(cache->up_ptr);
-    }
-    if (cache->down_ptr) {
-        (void)cudaFree(cache->down_ptr);
-    }
-    std::vector<cuda_stream_expert_cache_slot>().swap(cache->slots);
-    cache->valid = 0;
-    cache->capacity = 0;
-    cache->count = 0;
-    cache->tick = 0;
-    cache->gate_expert_bytes = 0;
-    cache->down_expert_bytes = 0;
-    cache->gate_ptr = NULL;
-    cache->up_ptr = NULL;
-    cache->down_ptr = NULL;
-    cache->gate_capacity = 0;
-    cache->up_capacity = 0;
-    cache->down_capacity = 0;
-}
-
-static void cuda_stream_expert_cache_release_all(void) {
-    for (int i = 0; i < DS4_CUDA_STREAM_EXPERT_CLASSES; i++) {
-        cuda_stream_expert_cache_release_class(i);
-        g_stream_expert_class_gate_bytes[i] = 0;
-        g_stream_expert_class_down_bytes[i] = 0;
-        g_stream_expert_runtime_caps[i] = 0;
-        g_stream_expert_memory_cap_notices[i] = 0;
-    }
-}
-
-static void cuda_stream_expert_cache_invalidate(void) {
-    for (int i = 0; i < DS4_CUDA_STREAM_EXPERT_CLASSES; i++) {
-        cuda_stream_expert_cache *cache = &g_stream_expert_caches[i];
-        for (cuda_stream_expert_cache_slot &slot : cache->slots) {
-            slot.valid = 0;
-        }
-        cache->valid = 0;
-        cache->count = 0;
-        cache->tick = 0;
-    }
->>>>>>> 10ba298 (CUDA streaming: restore resident expert cache for selected loads)
 }
 
 static uint32_t cuda_stream_expert_cache_requested_budget(void) {
@@ -23802,44 +23735,15 @@ static uint32_t cuda_stream_expert_cache_requested_budget(void) {
     return cap;
 }
 
-<<<<<<< HEAD
 static uint32_t cuda_stream_expert_cache_configured_budget(void) {
     uint32_t cap = cuda_stream_expert_cache_requested_budget();
     ds4_ssd_ctx *ssd = ssd_current();
     if (ssd->runtime_cap != 0 && cap > ssd->runtime_cap) {
         cap = ssd->runtime_cap;
-=======
-static uint32_t cuda_stream_expert_cache_configured_budget_class(int class_idx) {
-    uint32_t cap = cuda_stream_expert_cache_requested_budget();
-    if (g_stream_expert_runtime_caps[class_idx] != 0 &&
-        cap > g_stream_expert_runtime_caps[class_idx]) {
-        cap = g_stream_expert_runtime_caps[class_idx];
->>>>>>> 10ba298 (CUDA streaming: restore resident expert cache for selected loads)
     }
     return cap;
 }
 
-<<<<<<< HEAD
-=======
-/* Class-less view (reporting/shared queries): apply the most restrictive
- * runtime cap across the active size classes. */
-static uint32_t cuda_stream_expert_cache_configured_budget(void) {
-    uint32_t cap = cuda_stream_expert_cache_requested_budget();
-    for (int i = 0; i < DS4_CUDA_STREAM_EXPERT_CLASSES; i++) {
-        if ((g_stream_expert_class_gate_bytes[i] != 0 ||
-             g_stream_expert_class_down_bytes[i] != 0) &&
-            g_stream_expert_runtime_caps[i] != 0 &&
-            cap > g_stream_expert_runtime_caps[i]) {
-            cap = g_stream_expert_runtime_caps[i];
-        }
-    }
-    return cap;
-}
-
-/* The shared graph code sizes its expert working-set estimates on the cache
- * budget; only report a budget there when the operator explicitly opted in,
- * so default runs keep the upstream working-set behavior. */
->>>>>>> 10ba298 (CUDA streaming: restore resident expert cache for selected loads)
 static int cuda_stream_expert_cache_budget_visible_to_shared(void) {
     if (!g_ssd_streaming_mode) return 0;
     if (g_stream_expert_budget_override != 0) return 1;
@@ -23869,19 +23773,12 @@ static uint64_t cuda_stream_expert_cache_reserve_bytes(void) {
 }
 
 static uint32_t cuda_stream_expert_cache_live_budget(
-<<<<<<< HEAD
-=======
-        int class_idx,
->>>>>>> 10ba298 (CUDA streaming: restore resident expert cache for selected loads)
         uint32_t requested,
         uint64_t gate_expert_bytes,
         uint64_t down_expert_bytes,
         uint64_t reclaim_bytes,
         int report) {
-<<<<<<< HEAD
     ds4_ssd_ctx *ssd = ssd_current();
-=======
->>>>>>> 10ba298 (CUDA streaming: restore resident expert cache for selected loads)
     if (requested == 0 ||
         gate_expert_bytes == 0 ||
         down_expert_bytes == 0 ||
@@ -23916,21 +23813,13 @@ static uint32_t cuda_stream_expert_cache_live_budget(
         reserve = total_bytes / 2ull;
     }
     if (free_bytes <= reserve) {
-<<<<<<< HEAD
         if (report && ssd->memory_cap_notice != requested) {
-=======
-        if (report && g_stream_expert_memory_cap_notices[class_idx] != requested) {
->>>>>>> 10ba298 (CUDA streaming: restore resident expert cache for selected loads)
             cuda_model_load_progress_finish();
             fprintf(stderr,
                     "ds4: CUDA streaming expert cache disabled: available %.2f GiB <= reserve %.2f GiB\n",
                     (double)free_bytes / 1073741824.0,
                     (double)reserve / 1073741824.0);
-<<<<<<< HEAD
             ssd->memory_cap_notice = requested;
-=======
-            g_stream_expert_memory_cap_notices[class_idx] = requested;
->>>>>>> 10ba298 (CUDA streaming: restore resident expert cache for selected loads)
         }
         return 0;
     }
@@ -23940,12 +23829,7 @@ static uint32_t cuda_stream_expert_cache_live_budget(
     if (max_slots64 > UINT32_MAX) max_slots64 = UINT32_MAX;
     uint32_t capped = requested;
     if ((uint64_t)capped > max_slots64) capped = (uint32_t)max_slots64;
-<<<<<<< HEAD
     if (report && capped != requested && ssd->memory_cap_notice != capped) {
-=======
-    if (report && capped != requested &&
-        g_stream_expert_memory_cap_notices[class_idx] != capped) {
->>>>>>> 10ba298 (CUDA streaming: restore resident expert cache for selected loads)
         cuda_model_load_progress_finish();
         fprintf(stderr,
                 "ds4: CUDA streaming expert cache capped from %u to %u experts "
@@ -23955,11 +23839,7 @@ static uint32_t cuda_stream_expert_cache_live_budget(
                 (double)free_bytes / 1073741824.0,
                 (double)reserve / 1073741824.0,
                 (double)per_expert_bytes / 1048576.0);
-<<<<<<< HEAD
         ssd->memory_cap_notice = capped;
-=======
-        g_stream_expert_memory_cap_notices[class_idx] = capped;
->>>>>>> 10ba298 (CUDA streaming: restore resident expert cache for selected loads)
     }
     return capped;
 }
@@ -23975,7 +23855,6 @@ static uint64_t cuda_stream_expert_cache_expert_bytes(
     return gate_expert_bytes * 2ull + down_expert_bytes;
 }
 
-<<<<<<< HEAD
 static void cuda_stream_expert_cache_note_size(
         uint64_t gate_expert_bytes,
         uint64_t down_expert_bytes) {
@@ -23988,38 +23867,6 @@ static void cuda_stream_expert_cache_note_size(
     ssd->runtime_down_bytes = down_expert_bytes;
     ssd->runtime_cap = 0;
     ssd->memory_cap_notice = 0;
-=======
-/* Return the size-class index for (gate,down), assigning a free slot on
- * first appearance. If distinct classes ever exceed
- * DS4_CUDA_STREAM_EXPERT_CLASSES (never observed in official GGUFs), class 0
- * is recycled: that size falls back to rebuild-on-transition without
- * touching the other classes. */
-static int cuda_stream_expert_cache_class_index(
-        uint64_t gate_expert_bytes,
-        uint64_t down_expert_bytes) {
-    for (int i = 0; i < DS4_CUDA_STREAM_EXPERT_CLASSES; i++) {
-        if (g_stream_expert_class_gate_bytes[i] == gate_expert_bytes &&
-            g_stream_expert_class_down_bytes[i] == down_expert_bytes) {
-            return i;
-        }
-    }
-    for (int i = 0; i < DS4_CUDA_STREAM_EXPERT_CLASSES; i++) {
-        if (g_stream_expert_class_gate_bytes[i] == 0 &&
-            g_stream_expert_class_down_bytes[i] == 0) {
-            g_stream_expert_class_gate_bytes[i] = gate_expert_bytes;
-            g_stream_expert_class_down_bytes[i] = down_expert_bytes;
-            g_stream_expert_runtime_caps[i] = 0;
-            g_stream_expert_memory_cap_notices[i] = 0;
-            return i;
-        }
-    }
-    cuda_stream_expert_cache_release_class(0);
-    g_stream_expert_class_gate_bytes[0] = gate_expert_bytes;
-    g_stream_expert_class_down_bytes[0] = down_expert_bytes;
-    g_stream_expert_runtime_caps[0] = 0;
-    g_stream_expert_memory_cap_notices[0] = 0;
-    return 0;
->>>>>>> 10ba298 (CUDA streaming: restore resident expert cache for selected loads)
 }
 
 static uint32_t cuda_stream_expert_cache_shrunken_cap(uint32_t cap) {
@@ -24029,28 +23876,16 @@ static uint32_t cuda_stream_expert_cache_shrunken_cap(uint32_t cap) {
 }
 
 static void cuda_stream_expert_cache_note_oom_cap(
-<<<<<<< HEAD
-=======
-        int class_idx,
->>>>>>> 10ba298 (CUDA streaming: restore resident expert cache for selected loads)
         uint32_t failed_cap,
         uint32_t new_cap,
         uint64_t expert_bytes,
         const char *errstr) {
-<<<<<<< HEAD
     ds4_ssd_ctx *ssd = ssd_current();
     if (ssd->runtime_cap != 0 &&
         ssd->runtime_cap <= new_cap) {
         return;
     }
     ssd->runtime_cap = new_cap;
-=======
-    if (g_stream_expert_runtime_caps[class_idx] != 0 &&
-        g_stream_expert_runtime_caps[class_idx] <= new_cap) {
-        return;
-    }
-    g_stream_expert_runtime_caps[class_idx] = new_cap;
->>>>>>> 10ba298 (CUDA streaming: restore resident expert cache for selected loads)
     const uint32_t released =
         failed_cap > new_cap ? failed_cap - new_cap : 0;
     cuda_model_load_progress_finish();
@@ -24126,17 +23961,10 @@ static cuda_stream_expert_cache *cuda_stream_expert_cache_prepare(
         uint64_t gate_expert_bytes,
         uint64_t down_expert_bytes,
         uint32_t target_cap) {
-<<<<<<< HEAD
-=======
-    /* The resident cache assumes the single-GPU streaming placement (all
-     * buffers live on device 0, like the selected staging cache). */
-    if (g_n_gpus != 1) return NULL;
->>>>>>> 10ba298 (CUDA streaming: restore resident expert cache for selected loads)
     const uint64_t expert_bytes =
         cuda_stream_expert_cache_expert_bytes(gate_expert_bytes,
                                               down_expert_bytes);
     if (expert_bytes == 0) return NULL;
-<<<<<<< HEAD
     cuda_stream_expert_cache_note_size(gate_expert_bytes, down_expert_bytes);
 
     const uint32_t requested_cap = cuda_stream_expert_cache_configured_budget();
@@ -24156,57 +23984,22 @@ static cuda_stream_expert_cache *cuda_stream_expert_cache_prepare(
         ec->capacity >= target_cap &&
         ec->slots.size() == ec->capacity) {
         return ec;
-=======
-    const int class_idx =
-        cuda_stream_expert_cache_class_index(gate_expert_bytes,
-                                             down_expert_bytes);
-    cuda_stream_expert_cache *cache = &g_stream_expert_caches[class_idx];
-
-    const uint32_t requested_cap =
-        cuda_stream_expert_cache_configured_budget_class(class_idx);
-    if (requested_cap == 0) return NULL;
-    if (target_cap == 0 || target_cap > requested_cap) target_cap = requested_cap;
-    if (target_cap == 0) return NULL;
-    const int same_dims =
-        cache->valid &&
-        cache->gate_expert_bytes == gate_expert_bytes &&
-        cache->down_expert_bytes == down_expert_bytes;
-    if (!same_dims && cache->valid) {
-        cuda_stream_expert_cache_release_class(class_idx);
-    }
-    if (same_dims &&
-        cache->capacity != 0 &&
-        cache->capacity >= target_cap &&
-        cache->slots.size() == cache->capacity) {
-        return cache;
->>>>>>> 10ba298 (CUDA streaming: restore resident expert cache for selected loads)
     }
 
     uint64_t reclaim_bytes = 0;
     if (same_dims &&
-<<<<<<< HEAD
         ec->capacity != 0 &&
         (uint64_t)ec->capacity <= UINT64_MAX / expert_bytes) {
         reclaim_bytes = (uint64_t)ec->capacity * expert_bytes;
     }
     uint32_t cap =
         cuda_stream_expert_cache_live_budget(target_cap,
-=======
-        cache->capacity != 0 &&
-        (uint64_t)cache->capacity <= UINT64_MAX / expert_bytes) {
-        reclaim_bytes = (uint64_t)cache->capacity * expert_bytes;
-    }
-    uint32_t cap =
-        cuda_stream_expert_cache_live_budget(class_idx,
-                                             target_cap,
->>>>>>> 10ba298 (CUDA streaming: restore resident expert cache for selected loads)
                                              gate_expert_bytes,
                                              down_expert_bytes,
                                              reclaim_bytes,
                                              reclaim_bytes == 0);
     if (cap == 0) return NULL;
     if (same_dims &&
-<<<<<<< HEAD
         ec->capacity != 0 &&
         ec->capacity >= cap &&
         ec->slots.size() == ec->capacity) {
@@ -24215,15 +24008,6 @@ static cuda_stream_expert_cache *cuda_stream_expert_cache_prepare(
 
     cuda_stream_expert_cache_release_all();
     ec = &ssd_current()->expert_cache;
-=======
-        cache->capacity != 0 &&
-        cache->capacity >= cap &&
-        cache->slots.size() == cache->capacity) {
-        return cache;
-    }
-
-    cuda_stream_expert_cache_release_class(class_idx);
->>>>>>> 10ba298 (CUDA streaming: restore resident expert cache for selected loads)
     while (cap != 0) {
         if ((uint64_t)cap > UINT64_MAX / gate_expert_bytes ||
             (uint64_t)cap > UINT64_MAX / down_expert_bytes) {
@@ -24244,23 +24028,13 @@ static cuda_stream_expert_cache *cuda_stream_expert_cache_prepare(
                                                 &alloc_error)) {
             const uint32_t new_cap =
                 cuda_stream_expert_cache_shrunken_cap(cap);
-<<<<<<< HEAD
             cuda_stream_expert_cache_note_oom_cap(cap,
-=======
-            cuda_stream_expert_cache_note_oom_cap(class_idx,
-                                                  cap,
->>>>>>> 10ba298 (CUDA streaming: restore resident expert cache for selected loads)
                                                   new_cap,
                                                   expert_bytes,
                                                   alloc_error);
             cap = new_cap;
             if (cap != 0) {
-<<<<<<< HEAD
                 cap = cuda_stream_expert_cache_live_budget(cap,
-=======
-                cap = cuda_stream_expert_cache_live_budget(class_idx,
-                                                           cap,
->>>>>>> 10ba298 (CUDA streaming: restore resident expert cache for selected loads)
                                                            gate_expert_bytes,
                                                            down_expert_bytes,
                                                            0,
@@ -24270,17 +24044,12 @@ static cuda_stream_expert_cache *cuda_stream_expert_cache_prepare(
         }
 
         try {
-<<<<<<< HEAD
             ec->slots.resize(cap);
-=======
-            cache->slots.resize(cap);
->>>>>>> 10ba298 (CUDA streaming: restore resident expert cache for selected loads)
         } catch (...) {
             fprintf(stderr, "ds4: CUDA streaming expert cache metadata allocation failed\n");
             (void)cudaFree(gate_ptr);
             (void)cudaFree(up_ptr);
             (void)cudaFree(down_ptr);
-<<<<<<< HEAD
             cuda_stream_expert_cache_release_all();
             return NULL;
         }
@@ -24301,28 +24070,6 @@ static cuda_stream_expert_cache *cuda_stream_expert_cache_prepare(
         ec->down_capacity =
             (uint64_t)cap * down_expert_bytes;
         return ec;
-=======
-            cuda_stream_expert_cache_release_class(class_idx);
-            return NULL;
-        }
-
-        cache->valid = 1;
-        cache->capacity = cap;
-        cache->count = 0;
-        cache->tick = 0;
-        cache->gate_expert_bytes = gate_expert_bytes;
-        cache->down_expert_bytes = down_expert_bytes;
-        cache->gate_ptr = gate_ptr;
-        cache->up_ptr = up_ptr;
-        cache->down_ptr = down_ptr;
-        cache->gate_capacity =
-            (uint64_t)cap * gate_expert_bytes;
-        cache->up_capacity =
-            (uint64_t)cap * gate_expert_bytes;
-        cache->down_capacity =
-            (uint64_t)cap * down_expert_bytes;
-        return cache;
->>>>>>> 10ba298 (CUDA streaming: restore resident expert cache for selected loads)
     }
     return NULL;
 }
@@ -24508,45 +24255,6 @@ static int cuda_stream_expert_cache_seed_one(
     return 1;
 }
 
-<<<<<<< HEAD
-=======
-static int cuda_stream_layer_expert_ranges_valid(
-        uint64_t model_size,
-        uint32_t n_total_expert,
-        uint64_t gate_offset,
-        uint64_t up_offset,
-        uint64_t down_offset,
-        uint64_t gate_expert_bytes,
-        uint64_t down_expert_bytes,
-        const char *what) {
-    if (n_total_expert == 0 ||
-        gate_expert_bytes == 0 ||
-        down_expert_bytes == 0 ||
-        (uint64_t)n_total_expert > UINT64_MAX / gate_expert_bytes ||
-        (uint64_t)n_total_expert > UINT64_MAX / down_expert_bytes) {
-        fprintf(stderr,
-                "ds4: CUDA streaming %s expert size overflow\n",
-                what ? what : "selected");
-        return 0;
-    }
-    const uint64_t full_gate_bytes =
-        (uint64_t)n_total_expert * gate_expert_bytes;
-    const uint64_t full_down_bytes =
-        (uint64_t)n_total_expert * down_expert_bytes;
-    if (gate_offset > model_size || up_offset > model_size ||
-        down_offset > model_size ||
-        full_gate_bytes > model_size - gate_offset ||
-        full_gate_bytes > model_size - up_offset ||
-        full_down_bytes > model_size - down_offset) {
-        fprintf(stderr,
-                "ds4: CUDA streaming %s expert range outside model map\n",
-                what ? what : "selected");
-        return 0;
-    }
-    return 1;
-}
-
->>>>>>> 10ba298 (CUDA streaming: restore resident expert cache for selected loads)
 static int cuda_stream_selected_cache_begin_load(
         const ds4_gpu_stream_expert_table *table,
         const int32_t *selected_ids,
@@ -24607,7 +24315,6 @@ static int cuda_stream_selected_cache_begin_load(
     for (int t = 0; t < g_n_gpus; t++) {
         if (g_gpu[t].device_id == ambient_dev) { logical_tier = t; break; }
     }
-<<<<<<< HEAD
     cuda_stream_selected_cache *sc = &ssd_current()->selected_cache;
     if (sc->logical_tier != logical_tier &&
         (sc->gate_ptr ||
@@ -24630,53 +24337,10 @@ static int cuda_stream_selected_cache_begin_load(
                 &sc->down_capacity,
                 down_bytes, "down experts") ||
         !cuda_stream_selected_ensure_i32(slot_count)) {
-=======
-    if (ds4_gpu_set_current_device(logical_tier) != 0) {
-        cuda_stream_selected_cache_invalidate();
-        return 0;
-    }
-    /* Try to allocate the staging buffers with the resident expert cache
-     * still in place: an unconditional release here would throw away the
-     * warm decode working set on every request. Only when VRAM is really
-     * short (very long prompts) sacrifice the cache and retry once. */
-    int selected_ok =
-        cuda_stream_selected_ensure_bytes(
-                &g_stream_selected_cache.gate_ptr,
-                &g_stream_selected_cache.gate_capacity,
-                gate_bytes, "gate experts") &&
-        cuda_stream_selected_ensure_bytes(
-                &g_stream_selected_cache.up_ptr,
-                &g_stream_selected_cache.up_capacity,
-                gate_bytes, "up experts") &&
-        cuda_stream_selected_ensure_bytes(
-                &g_stream_selected_cache.down_ptr,
-                &g_stream_selected_cache.down_capacity,
-                down_bytes, "down experts") &&
-        cuda_stream_selected_ensure_i32(slot_count);
-    if (!selected_ok) {
-        cuda_stream_expert_cache_release_all();
-        selected_ok =
-            cuda_stream_selected_ensure_bytes(
-                    &g_stream_selected_cache.gate_ptr,
-                    &g_stream_selected_cache.gate_capacity,
-                    gate_bytes, "gate experts") &&
-            cuda_stream_selected_ensure_bytes(
-                    &g_stream_selected_cache.up_ptr,
-                    &g_stream_selected_cache.up_capacity,
-                    gate_bytes, "up experts") &&
-            cuda_stream_selected_ensure_bytes(
-                    &g_stream_selected_cache.down_ptr,
-                    &g_stream_selected_cache.down_capacity,
-                    down_bytes, "down experts") &&
-            cuda_stream_selected_ensure_i32(slot_count);
-    }
-    if (!selected_ok) {
->>>>>>> 10ba298 (CUDA streaming: restore resident expert cache for selected loads)
         cuda_stream_selected_cache_invalidate();
         return 0;
     }
 
-<<<<<<< HEAD
     /* Consult the resident LRU expert cache (per-tier). On a hit, copy the
      * expert's gate/up/down slab D2D from the LRU to the per-request compact
      * cache (no SSD read). On a miss, stream the expert from SSD into a free
@@ -24691,26 +24355,11 @@ static int cuda_stream_selected_cache_begin_load(
         cuda_stream_expert_cache_budget_visible_to_shared() &&
         configured_cache_budget != 0;
     cuda_stream_expert_cache *expert_cache = use_global_cache ?
-=======
-    const uint32_t configured_cache_budget =
-        cuda_stream_expert_cache_configured_budget_class(
-            cuda_stream_expert_cache_class_index(table->gate_expert_bytes,
-                                                 table->down_expert_bytes));
-    cuda_stream_expert_cache *expert_cache = configured_cache_budget != 0 ?
->>>>>>> 10ba298 (CUDA streaming: restore resident expert cache for selected loads)
         cuda_stream_expert_cache_prepare(table->gate_expert_bytes,
                                          table->down_expert_bytes,
                                          configured_cache_budget) :
         NULL;
     int expert_cache_disabled = expert_cache == NULL;
-<<<<<<< HEAD
-=======
-    const uint32_t cache_count_before =
-        expert_cache && expert_cache->valid ? expert_cache->count : 0;
-    uint32_t cache_hits = 0;
-    uint32_t cache_misses = 0;
-    uint32_t direct_loads = 0;
->>>>>>> 10ba298 (CUDA streaming: restore resident expert cache for selected loads)
 
     for (uint32_t i = 0; i < compact_ids.size(); i++) {
         const uint64_t expert = (uint32_t)compact_ids[i];
@@ -24732,7 +24381,6 @@ static int cuda_stream_selected_cache_begin_load(
                                               table->gate_expert_bytes,
                                               table->down_expert_bytes);
             if (cache_slot >= 0) {
-<<<<<<< HEAD
                 expert_cache->slots[(uint32_t)cache_slot].age =
                     ++expert_cache->tick;
             } else {
@@ -24759,45 +24407,6 @@ static int cuda_stream_selected_cache_begin_load(
                     cuda_stream_expert_cache_invalidate();
                     expert_cache_disabled = 1;
                     cache_slot = -1;
-=======
-                cache_hits++;
-                expert_cache->slots[(uint32_t)cache_slot].age =
-                    ++expert_cache->tick;
-            } else {
-                cache_misses++;
-                /* Prefill batch loads (allow_cache_evict=0) may append while
-                 * there is free capacity but must NOT evict valid slots: a
-                 * long prompt would cycle the whole LRU cache and destroy
-                 * the decode working set. */
-                if (allow_cache_evict ||
-                    expert_cache->count < expert_cache->capacity) {
-                    const uint32_t load_slot =
-                        cuda_stream_expert_cache_lru_slot(expert_cache);
-                    const int append = !expert_cache->slots[load_slot].valid;
-                    if (cuda_stream_expert_cache_load_slot(
-                                expert_cache,
-                                table->model_map,
-                                table->model_size,
-                                load_slot,
-                                table->layer,
-                                table->n_total_expert,
-                                (uint32_t)expert,
-                                table->gate_offset,
-                                table->up_offset,
-                                table->down_offset,
-                                table->gate_expert_bytes,
-                                table->down_expert_bytes)) {
-                        if (append &&
-                            expert_cache->count < expert_cache->capacity) {
-                            expert_cache->count++;
-                        }
-                        cache_slot = (int)load_slot;
-                    } else {
-                        cuda_stream_expert_cache_invalidate();
-                        expert_cache_disabled = 1;
-                        cache_slot = -1;
-                    }
->>>>>>> 10ba298 (CUDA streaming: restore resident expert cache for selected loads)
                 }
             }
 
@@ -24807,21 +24416,14 @@ static int cuda_stream_selected_cache_begin_load(
                             expert_cache,
                             (uint32_t)cache_slot,
                             i,
-<<<<<<< HEAD
                             sc->gate_ptr,
                             sc->up_ptr,
                             sc->down_ptr);
-=======
-                            g_stream_selected_cache.gate_ptr,
-                            g_stream_selected_cache.up_ptr,
-                            g_stream_selected_cache.down_ptr);
->>>>>>> 10ba298 (CUDA streaming: restore resident expert cache for selected loads)
                 if (!copied_from_global_cache) {
                     cuda_stream_expert_cache_invalidate();
                     expert_cache_disabled = 1;
                 }
             }
-<<<<<<< HEAD
         }
 
         if (!copied_from_global_cache) {
@@ -24849,54 +24451,9 @@ static int cuda_stream_selected_cache_begin_load(
                 cuda_stream_selected_cache_invalidate();
                 return 0;
             }
-=======
->>>>>>> 10ba298 (CUDA streaming: restore resident expert cache for selected loads)
-        }
-
-        if (!copied_from_global_cache) {
-            const uint64_t gate_src =
-                table->gate_offset + expert * table->gate_expert_bytes;
-            const uint64_t up_src =
-                table->up_offset + expert * table->gate_expert_bytes;
-            const uint64_t down_src =
-                table->down_offset + expert * table->down_expert_bytes;
-            direct_loads++;
-            if (!cuda_model_copy_to_device_streamed(
-                        g_stream_selected_cache.gate_ptr + gate_dst,
-                        table->model_map, table->model_size,
-                        gate_src, table->gate_expert_bytes,
-                        "stream gate expert copy") ||
-                !cuda_model_copy_to_device_streamed(
-                        g_stream_selected_cache.up_ptr + gate_dst,
-                        table->model_map, table->model_size,
-                        up_src, table->gate_expert_bytes,
-                        "stream up expert copy") ||
-                !cuda_model_copy_to_device_streamed(
-                        g_stream_selected_cache.down_ptr + down_dst,
-                        table->model_map, table->model_size,
-                        down_src, table->down_expert_bytes,
-                        "stream down expert copy")) {
-                cuda_stream_selected_cache_invalidate();
-                return 0;
-            }
         }
     }
 
-    if (getenv("DS4_CUDA_STREAMING_EXPERT_CACHE_VERBOSE")) {
-        cuda_model_load_progress_finish();
-        fprintf(stderr,
-                "ds4: CUDA streaming selected layer=%u slots=%u compact=%u "
-                "global_budget=%u before=%u after=%u hits=%u misses=%u direct=%u\n",
-                table->layer,
-                slot_count,
-                (uint32_t)compact_ids.size(),
-                expert_cache && expert_cache->valid ? expert_cache->capacity : 0,
-                cache_count_before,
-                expert_cache && expert_cache->valid ? expert_cache->count : 0,
-                cache_hits,
-                cache_misses,
-                direct_loads);
-    }
     if (!cuda_ok(cudaMemcpy(sc->slot_selected_ptr,
                             slot_ids.data(),
                             (size_t)slot_count * sizeof(int32_t),
@@ -29106,15 +28663,8 @@ extern "C" uint32_t ds4_gpu_stream_expert_cache_budget_for_expert_size(
                                               down_expert_bytes) == 0) {
         return 0;
     }
-<<<<<<< HEAD
     cuda_stream_expert_cache_note_size(gate_expert_bytes, down_expert_bytes);
     return cuda_stream_expert_cache_configured_budget();
-=======
-    const int class_idx =
-        cuda_stream_expert_cache_class_index(gate_expert_bytes,
-                                             down_expert_bytes);
-    return cuda_stream_expert_cache_configured_budget_class(class_idx);
->>>>>>> 10ba298 (CUDA streaming: restore resident expert cache for selected loads)
 }
 
 extern "C" int ds4_gpu_tensor_copy_f32_to_f16(ds4_gpu_tensor *dst, uint64_t dst_offset,
@@ -29225,7 +28775,6 @@ extern "C" void ds4_gpu_set_glm_model(bool enabled) {
 
 extern "C" void ds4_gpu_set_ssd_streaming(bool enabled) {
     g_ssd_streaming_mode = enabled ? 1 : 0;
-<<<<<<< HEAD
     /* Multi-tier: reset runtime caps on EVERY tier and, when disabling, free
      * each tier's caches on the device that owns them. cudaSetDevice before
      * the release helpers so ssd_current() resolves to g_ssd[t]. The LRU
@@ -29272,24 +28821,6 @@ extern "C" void ds4_gpu_set_streaming_expert_cache_budget(uint32_t experts) {
         cuda_stream_expert_cache_release_all();
     }
     if (prev >= 0) (void)cudaSetDevice(prev);
-=======
-    for (int i = 0; i < DS4_CUDA_STREAM_EXPERT_CLASSES; i++) {
-        g_stream_expert_runtime_caps[i] = 0;
-        g_stream_expert_memory_cap_notices[i] = 0;
-    }
-    cuda_stream_selected_cache_invalidate();
-    if (!g_ssd_streaming_mode) {
-        cuda_stream_selected_cache_release();
-        cuda_stream_expert_cache_release_all();
-    }
-}
-
-extern "C" void ds4_gpu_set_streaming_expert_cache_budget(uint32_t experts) {
-    g_stream_expert_budget_override = experts;
-    cuda_stream_selected_cache_invalidate();
-    /* release_all also clears the size classes, runtime caps and notices. */
-    cuda_stream_expert_cache_release_all();
->>>>>>> 10ba298 (CUDA streaming: restore resident expert cache for selected loads)
 }
 
 extern "C" void ds4_gpu_set_streaming_expert_cache_expert_bytes(uint64_t bytes) {
@@ -29302,24 +28833,15 @@ extern "C" uint32_t ds4_gpu_stream_expert_cache_configured_count(void) {
 }
 
 extern "C" uint32_t ds4_gpu_stream_expert_cache_current_count(void) {
-<<<<<<< HEAD
     /* Status readout: report the active tier's resident count. Per-layer
      * dispatch has set the device; ssd_current() returns the right tier. */
     return ssd_current()->expert_cache.count;
-=======
-    uint32_t count = 0;
-    for (int i = 0; i < DS4_CUDA_STREAM_EXPERT_CLASSES; i++) {
-        count += g_stream_expert_caches[i].count;
-    }
-    return count;
->>>>>>> 10ba298 (CUDA streaming: restore resident expert cache for selected loads)
 }
 
 extern "C" void ds4_gpu_stream_expert_cache_reset_route_hotness(void) {
 }
 
 extern "C" void ds4_gpu_stream_expert_cache_release_resident(void) {
-<<<<<<< HEAD
     /* Release resident expert caches on every tier (each on its own device). */
     const int n = g_n_gpus > 0 ? g_n_gpus : 1;
     int prev = -1;
@@ -29329,10 +28851,6 @@ extern "C" void ds4_gpu_stream_expert_cache_release_resident(void) {
         cuda_stream_expert_cache_release_all();
     }
     if (prev >= 0) (void)cudaSetDevice(prev);
-=======
-    cuda_stream_expert_cache_release_all();
-    cuda_stream_selected_cache_release();
->>>>>>> 10ba298 (CUDA streaming: restore resident expert cache for selected loads)
 }
 
 extern "C" int ds4_gpu_stream_expert_cache_seed_selected(
@@ -29340,37 +28858,13 @@ extern "C" int ds4_gpu_stream_expert_cache_seed_selected(
         const int32_t *selected_ids,
         uint32_t n_selected) {
     if (!g_ssd_streaming_mode) return 1;
-<<<<<<< HEAD
     if (!table || !selected_ids || n_selected == 0 ||
         n_selected > table->n_total_expert ||
         !cuda_stream_selected_ranges_valid(table)) {
-=======
-    if (!table) return 0;
-    const void *model_map = table->model_map;
-    const uint64_t model_size = table->model_size;
-    const uint32_t layer = table->layer;
-    const uint32_t n_total_expert = table->n_total_expert;
-    const uint64_t gate_offset = table->gate_offset;
-    const uint64_t up_offset = table->up_offset;
-    const uint64_t down_offset = table->down_offset;
-    const uint64_t gate_expert_bytes = table->gate_expert_bytes;
-    const uint64_t down_expert_bytes = table->down_expert_bytes;
-    if (!model_map || !selected_ids || n_selected == 0 ||
-        n_selected > n_total_expert ||
-        !cuda_stream_layer_expert_ranges_valid(model_size,
-                                               n_total_expert,
-                                               gate_offset,
-                                               up_offset,
-                                               down_offset,
-                                               gate_expert_bytes,
-                                               down_expert_bytes,
-                                               "seed selected")) {
->>>>>>> 10ba298 (CUDA streaming: restore resident expert cache for selected loads)
         return 0;
     }
 
     cuda_stream_expert_cache *cache =
-<<<<<<< HEAD
         cuda_stream_expert_cache_prepare(table->gate_expert_bytes,
                                          table->down_expert_bytes,
                                          n_selected);
@@ -29396,32 +28890,6 @@ extern "C" int ds4_gpu_stream_expert_cache_seed_selected(
                                                table->down_offset,
                                                table->gate_expert_bytes,
                                                table->down_expert_bytes)) {
-=======
-        cuda_stream_expert_cache_prepare(gate_expert_bytes,
-                                         down_expert_bytes,
-                                         n_selected);
-    if (!cache) return 1;
-    for (uint32_t i = 0; i < n_selected; i++) {
-        if (selected_ids[i] < 0 || (uint32_t)selected_ids[i] >= n_total_expert) {
-            fprintf(stderr,
-                    "ds4: CUDA streaming seed selected expert id %d is outside 0..%u at layer %u\n",
-                    selected_ids[i],
-                    n_total_expert,
-                    layer);
-            return 0;
-        }
-        if (!cuda_stream_expert_cache_seed_one(cache,
-                                               model_map,
-                                               model_size,
-                                               layer,
-                                               n_total_expert,
-                                               (uint32_t)selected_ids[i],
-                                               gate_offset,
-                                               up_offset,
-                                               down_offset,
-                                               gate_expert_bytes,
-                                               down_expert_bytes)) {
->>>>>>> 10ba298 (CUDA streaming: restore resident expert cache for selected loads)
             cuda_stream_expert_cache_invalidate();
             return 1;
         }
