@@ -23779,14 +23779,28 @@ static int cuda_stream_layer_expert_ranges_valid(
 
 static void cuda_stream_expert_cache_release_all(void) {
     ds4_ssd_ctx *ssd = ssd_current();
-    if (ssd->expert_cache.gate_ptr) {
+    /* Detect the unified-slab layout produced by try_alloc: when up_ptr is
+     * exactly gate_ptr + gate_capacity (and down_ptr is up_ptr + up_capacity),
+     * the three buffers belong to a single cudaMalloc and only gate_ptr is
+     * the allocation base. Freeing all three would double-free and crash. */
+    const int unified =
+        ssd->expert_cache.gate_ptr != NULL &&
+        ssd->expert_cache.up_ptr ==
+            ssd->expert_cache.gate_ptr + ssd->expert_cache.gate_capacity &&
+        ssd->expert_cache.down_ptr ==
+            ssd->expert_cache.up_ptr + ssd->expert_cache.up_capacity;
+    if (unified) {
         (void)cudaFree(ssd->expert_cache.gate_ptr);
-    }
-    if (ssd->expert_cache.up_ptr) {
-        (void)cudaFree(ssd->expert_cache.up_ptr);
-    }
-    if (ssd->expert_cache.down_ptr) {
-        (void)cudaFree(ssd->expert_cache.down_ptr);
+    } else {
+        if (ssd->expert_cache.gate_ptr) {
+            (void)cudaFree(ssd->expert_cache.gate_ptr);
+        }
+        if (ssd->expert_cache.up_ptr) {
+            (void)cudaFree(ssd->expert_cache.up_ptr);
+        }
+        if (ssd->expert_cache.down_ptr) {
+            (void)cudaFree(ssd->expert_cache.down_ptr);
+        }
     }
     ssd->expert_cache.slots.clear();
     memset(&ssd->expert_cache, 0, sizeof(ssd->expert_cache));
@@ -24000,6 +24014,57 @@ static void cuda_stream_expert_cache_note_oom_cap(
     }
 }
 
+/* Temporarily disable CUDA peer access on every (src, dst) pair so that a
+ * large cudaMalloc() inside the disabled window succeeds.
+ *
+ * The Ada / 4090-D driver reserves a substantial slice of each device's
+ * virtual address space for the peer-access mapping. With peer access
+ * enabled, a single cudaMalloc above ~25 GiB fails with
+ * cudaErrorMemoryAllocation even when cudaMemGetInfo reports 40+ GiB free
+ * (verified on driver 595.71.05). Disabling peer access lifts the limit;
+ * the allocation succeeds; re-enabling afterwards leaves the slab intact.
+ *
+ * Synchronizes every device before disabling so no in-flight peer memcpy
+ * is stranded. Returns a bitmask of pairs that were enabled (and thus must
+ * be re-enabled by restore_peer_access_after_alloc). */
+static uint32_t disable_peer_access_for_alloc(void) {
+    uint32_t flags = 0;
+    if (g_n_gpus <= 1) return 0;
+    for (int t = 0; t < g_n_gpus; t++) {
+        (void)cudaSetDevice(g_gpu[t].device_id);
+        (void)cudaDeviceSynchronize();
+    }
+    for (int t = 0; t < g_n_gpus; t++) {
+        for (int u = 0; u < g_n_gpus; u++) {
+            if (t == u) continue;
+            (void)cudaSetDevice(g_gpu[t].device_id);
+            (void)cudaGetLastError(); /* clear any stale error */
+            cudaError_t e = cudaDeviceDisablePeerAccess(g_gpu[u].device_id);
+            if (e == cudaSuccess) {
+                flags |= (1u << (t * DS4_MAX_GPUS + u));
+            } else {
+                (void)cudaGetLastError();
+            }
+        }
+    }
+    return flags;
+}
+
+static void restore_peer_access_after_alloc(uint32_t flags) {
+    if (g_n_gpus <= 1 || flags == 0) return;
+    for (int t = 0; t < g_n_gpus; t++) {
+        for (int u = 0; u < g_n_gpus; u++) {
+            if (t == u) continue;
+            if (flags & (1u << (t * DS4_MAX_GPUS + u))) {
+                (void)cudaSetDevice(g_gpu[t].device_id);
+                (void)cudaGetLastError();
+                cudaError_t e = cudaDeviceEnablePeerAccess(g_gpu[u].device_id, 0);
+                if (e != cudaSuccess) (void)cudaGetLastError();
+            }
+        }
+    }
+}
+
 static int cuda_stream_expert_cache_try_alloc(
         uint32_t cap,
         uint64_t gate_expert_bytes,
@@ -24020,52 +24085,50 @@ static int cuda_stream_expert_cache_try_alloc(
     const uint64_t gate_bytes = (uint64_t)cap * gate_expert_bytes;
     const uint64_t down_bytes = (uint64_t)cap * down_expert_bytes;
 
-    void *gate = NULL;
-    void *up = NULL;
-    void *down = NULL;
-    {
-        char wb[112];
-        snprintf(wb, sizeof(wb),
-                 "expert_cache cudaMalloc gate cap=%u want=%.2f MiB",
-                 cap, (double)gate_bytes / (1024.0 * 1024.0));
-        ds4_trace_vram(wb, -1);
+    /* Overflow check for the combined slab (gate+up share gate_expert_bytes). */
+    if (gate_bytes > UINT64_MAX - gate_bytes ||
+        2 * gate_bytes > UINT64_MAX - down_bytes) {
+        return 0;
     }
-    cudaError_t err = cudaMalloc(&gate, (size_t)gate_bytes);
-    if (err != cudaSuccess) goto fail;
-    ds4_trace_vram("expert_cache cudaMalloc gate OK", -1);
-    {
-        char wb[112];
-        snprintf(wb, sizeof(wb),
-                 "expert_cache cudaMalloc up   cap=%u want=%.2f MiB",
-                 cap, (double)gate_bytes / (1024.0 * 1024.0));
-        ds4_trace_vram(wb, -1);
-    }
-    err = cudaMalloc(&up, (size_t)gate_bytes);
-    if (err != cudaSuccess) goto fail;
-    ds4_trace_vram("expert_cache cudaMalloc up OK", -1);
-    {
-        char wb[112];
-        snprintf(wb, sizeof(wb),
-                 "expert_cache cudaMalloc down cap=%u want=%.2f MiB",
-                 cap, (double)down_bytes / (1024.0 * 1024.0));
-        ds4_trace_vram(wb, -1);
-    }
-    err = cudaMalloc(&down, (size_t)down_bytes);
-    if (err != cudaSuccess) goto fail;
-    ds4_trace_vram("expert_cache cudaMalloc down OK", -1);
+    const uint64_t total_bytes = 2 * gate_bytes + down_bytes;
 
-    *gate_ptr = (char *)gate;
-    *up_ptr = (char *)up;
-    *down_ptr = (char *)down;
-    return 1;
-
-fail:
-    if (errstr) *errstr = cudaGetErrorString(err);
+    /* Allocate the gate+up+down slab as ONE contiguous cudaMalloc and split it
+     * into three sub-buffers. The original code used three separate cudaMalloc
+     * invocations; under multi-GPU peer access each one consumes part of the
+     * VA reservation and the per-call ceiling drops further on every retry.
+     * Folding gate+up+down into one allocation halves the number of large
+     * cudaMalloc calls and lets a single disable_peer_access_for_alloc window
+     * cover the entire slab.
+     *
+     * release_all() detects the unified layout (up_ptr == gate_ptr +
+     * gate_capacity, down_ptr == up_ptr + up_capacity) and frees only
+     * gate_ptr so we do not double-free the slab. */
+    void *slab = NULL;
+    {
+        char wb[160];
+        snprintf(wb, sizeof(wb),
+                 "expert_cache cudaMalloc slab cap=%u want=%.2f MiB "
+                 "(gate+up+down unified)",
+                 cap, (double)total_bytes / (1024.0 * 1024.0));
+        ds4_trace_vram(wb, -1);
+    }
+    /* Clear any stale error so the cudaMalloc below returns its own status
+     * rather than a leftover from an earlier kernel/copy. */
     (void)cudaGetLastError();
-    if (gate) (void)cudaFree(gate);
-    if (up) (void)cudaFree(up);
-    if (down) (void)cudaFree(down);
-    return 0;
+    cudaError_t err = cudaMalloc(&slab, (size_t)total_bytes);
+    if (err != cudaSuccess) {
+        if (errstr) *errstr = cudaGetErrorString(err);
+        (void)cudaGetLastError();
+        ds4_trace_vram("expert_cache cudaMalloc slab FAILED", -1);
+        return 0;
+    }
+    ds4_trace_vram("expert_cache cudaMalloc slab OK", -1);
+
+    char *base = (char *)slab;
+    *gate_ptr = base;
+    *up_ptr = base + gate_bytes;
+    *down_ptr = base + 2 * gate_bytes;
+    return 1;
 }
 
 static cuda_stream_expert_cache *cuda_stream_expert_cache_prepare(
@@ -24119,11 +24182,23 @@ static cuda_stream_expert_cache *cuda_stream_expert_cache_prepare(
 
     cuda_stream_expert_cache_release_all();
     ec = &ssd_current()->expert_cache;
+
+    /* Disable peer access around the entire retry loop. With peer access
+     * enabled, the driver reserves a slice of each device's VA space that
+     * caps single cudaMalloc() at ~25 GiB regardless of free VRAM; the LRU
+     * slab (often 30+ GiB) cannot land. Disabling peer access lifts the cap;
+     * restore_peer_access_after_alloc re-enables it (the slab survives). */
+    const int prev_dev_for_peer = []{ int d=-1; (void)cudaGetDevice(&d); return d; }();
+    const uint32_t peer_flags = disable_peer_access_for_alloc();
+    if (prev_dev_for_peer >= 0) (void)cudaSetDevice(prev_dev_for_peer);
+    ds4_trace_vram("expert_cache peer access disabled for slab alloc", -1);
+
+    cuda_stream_expert_cache *prepare_result = NULL;
     while (cap != 0) {
         if ((uint64_t)cap > UINT64_MAX / gate_expert_bytes ||
             (uint64_t)cap > UINT64_MAX / down_expert_bytes) {
             fprintf(stderr, "ds4: CUDA streaming expert cache size overflow\n");
-            return NULL;
+            break;
         }
 
         char *gate_ptr = NULL;
@@ -24173,11 +24248,13 @@ static cuda_stream_expert_cache *cuda_stream_expert_cache_prepare(
             ec->slots.resize(cap);
         } catch (...) {
             fprintf(stderr, "ds4: CUDA streaming expert cache metadata allocation failed\n");
+            /* try_alloc returns a unified slab (gate_ptr is the base; up_ptr
+             * and down_ptr are contiguous offsets). Freeing only gate_ptr
+             * releases the whole slab — cudaFree on up_ptr/down_ptr would
+             * double-free. */
             (void)cudaFree(gate_ptr);
-            (void)cudaFree(up_ptr);
-            (void)cudaFree(down_ptr);
             cuda_stream_expert_cache_release_all();
-            return NULL;
+            break;
         }
 
         ec->valid = 1;
@@ -24195,9 +24272,18 @@ static cuda_stream_expert_cache *cuda_stream_expert_cache_prepare(
             (uint64_t)cap * gate_expert_bytes;
         ec->down_capacity =
             (uint64_t)cap * down_expert_bytes;
-        return ec;
+        prepare_result = ec;
+        break;
     }
-    return NULL;
+
+    /* Re-enable peer access unconditionally so the slab-alloc window is
+     * closed even on the failure path (no slab landed, no VA pressure). */
+    if (prev_dev_for_peer >= 0) (void)cudaSetDevice(prev_dev_for_peer);
+    restore_peer_access_after_alloc(peer_flags);
+    if (prev_dev_for_peer >= 0) (void)cudaSetDevice(prev_dev_for_peer);
+    ds4_trace_vram("expert_cache peer access restored", -1);
+
+    return prepare_result;
 }
 
 static int cuda_stream_expert_cache_find(
